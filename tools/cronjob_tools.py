@@ -219,6 +219,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("interpreter"):
+        result["interpreter"] = job["interpreter"]
     return result
 
 
@@ -241,6 +243,7 @@ def cronjob(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
+    interpreter: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -293,6 +296,7 @@ def cronjob(
                 context_from=context_from,
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
+                interpreter=_normalize_optional_job_value(interpreter),
             )
             return json.dumps(
                 {
@@ -406,6 +410,8 @@ def cronjob(
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
+            if interpreter is not None:
+                updates["interpreter"] = _normalize_optional_job_value(interpreter)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -527,6 +533,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
             },
+            "interpreter": {
+                "type": "string",
+                "description": "Optional Python interpreter/executable for the pre-run script, such as '~/workspace/.venv/bin/python3'. If omitted, Hermes uses its own runtime Python. On update, pass empty string to clear."
+            },
         },
         "required": ["action"]
     }
@@ -574,6 +584,7 @@ registry.register(
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
+        interpreter=args.get("interpreter"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

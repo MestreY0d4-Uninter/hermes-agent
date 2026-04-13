@@ -7555,7 +7555,9 @@ For more help on a command:
         "--deliver",
         help="Delivery target: origin, local, telegram, discord, signal, or platform:chat_id",
     )
-    cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
+    cron_create.add_argument(
+        "--repeat", type=int, help="Optional repeat count"
+    )
     cron_create.add_argument(
         "--skill",
         dest="skills",
@@ -7569,6 +7571,10 @@ For more help on a command:
     cron_create.add_argument(
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
+    )
+    cron_create.add_argument(
+        "--interpreter",
+        help="Optional Python interpreter/executable for the pre-run script",
     )
 
     # cron edit
@@ -7611,6 +7617,10 @@ For more help on a command:
     cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--interpreter",
+        help="Optional Python interpreter/executable for the pre-run script. Pass empty string to clear.",
     )
 
     # lifecycle actions

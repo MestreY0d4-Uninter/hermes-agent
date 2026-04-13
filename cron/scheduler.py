@@ -521,7 +521,7 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, interpreter: str | None = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -533,6 +533,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to a Python script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        interpreter: Optional Python interpreter/executable to use for the
+            script. Defaults to the current Hermes runtime Python.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -566,10 +568,11 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script path is not a file: {path}"
 
     script_timeout = _get_script_timeout()
+    interpreter_cmd = str(Path(interpreter).expanduser()) if interpreter else sys.executable
 
     try:
         result = subprocess.run(
-            [sys.executable, str(path)],
+            [interpreter_cmd, str(path)],
             capture_output=True,
             text=True,
             timeout=script_timeout,
@@ -648,7 +651,10 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path,
+                interpreter=job.get("interpreter"),
+            )
         if success:
             if script_output:
                 prompt = (
@@ -799,7 +805,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(
+            script_path,
+            interpreter=job.get("interpreter"),
+        )
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(

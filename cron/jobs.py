@@ -420,6 +420,7 @@ def create_job(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
+    interpreter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -451,6 +452,8 @@ def create_job(
                 terminal/file/code_exec tools use it as their working directory
                 (via TERMINAL_CWD).  When unset, the old behaviour is preserved
                 (no context files injected, tools use the scheduler's cwd).
+        interpreter: Optional Python interpreter to use when executing the script.
+                Defaults to the current Hermes runtime Python.
 
     Returns:
         The created job dict
@@ -484,6 +487,8 @@ def create_job(
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
+    normalized_interpreter = str(interpreter).strip() if isinstance(interpreter, str) else None
+    normalized_interpreter = normalized_interpreter or None
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -505,6 +510,7 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "context_from": context_from,
+        "interpreter": normalized_interpreter,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {
@@ -567,6 +573,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["workdir"] = None
             else:
                 updates["workdir"] = _normalize_workdir(_wd)
+        if "interpreter" in updates:
+            _interp = updates["interpreter"]
+            updates["interpreter"] = str(_interp).strip() if isinstance(_interp, str) else None
+            updates["interpreter"] = updates["interpreter"] or None
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates

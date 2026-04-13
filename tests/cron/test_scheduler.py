@@ -1417,8 +1417,10 @@ class TestRunJobWakeGate:
         import cron.scheduler as scheduler
 
         call_count = 0
-        def _script_stub(path):
+
+        def _script_stub(path, interpreter=None):
             nonlocal call_count
+            assert interpreter is None
             call_count += 1
             return (True, "regular output")
 

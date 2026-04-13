@@ -42,7 +42,7 @@ def cron_env(tmp_path, monkeypatch):
 
 
 class TestJobScriptField:
-    """Test that the script field is stored and retrieved correctly."""
+    """Test that script execution settings are stored and retrieved correctly."""
 
     def test_create_job_with_script(self, cron_env):
         from cron.jobs import create_job, get_job
@@ -56,6 +56,20 @@ class TestJobScriptField:
 
         loaded = get_job(job["id"])
         assert loaded["script"] == "/path/to/monitor.py"
+
+    def test_create_job_with_script_interpreter(self, cron_env):
+        from cron.jobs import create_job, get_job
+
+        job = create_job(
+            prompt="Analyze the data",
+            schedule="every 30m",
+            script="monitor.py",
+            interpreter="~/workspace/.venv/bin/python3",
+        )
+        assert job["interpreter"] == "~/workspace/.venv/bin/python3"
+
+        loaded = get_job(job["id"])
+        assert loaded["interpreter"] == "~/workspace/.venv/bin/python3"
 
     def test_create_job_without_script(self, cron_env):
         from cron.jobs import create_job
@@ -110,6 +124,31 @@ class TestRunJobScript:
         success, output = _run_job_script("relative.py")
         assert success is True
         assert output == "relative works"
+
+    def test_script_uses_configured_interpreter(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "uses_env.py"
+        script.write_text(textwrap.dedent("""\
+            import os
+            print(os.environ.get("CRON_WRAPPER_USED", "0"))
+        """))
+
+        wrapper = cron_env / "scripts" / "python-wrapper"
+        wrapper.write_text(textwrap.dedent(f"""\
+            #!{sys.executable}
+            import os
+            import sys
+
+            env = os.environ.copy()
+            env["CRON_WRAPPER_USED"] = "1"
+            os.execve(sys.executable, [sys.executable, *sys.argv[1:]], env)
+        """))
+        wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+
+        success, output = _run_job_script(str(script), interpreter=str(wrapper))
+        assert success is True
+        assert output == "1"
 
     def test_script_not_found(self, cron_env):
         from cron.scheduler import _run_job_script
@@ -193,6 +232,24 @@ class TestBuildJobPromptWithScript:
         assert "new PR: #123 fix typo" in prompt
         assert "Report any notable changes." in prompt
 
+    def test_build_job_prompt_passes_interpreter(self, cron_env):
+        from cron.scheduler import _build_job_prompt
+
+        script = cron_env / "scripts" / "collector.py"
+        script.write_text('print("ok")\n')
+
+        job = {
+            "prompt": "Report any notable changes.",
+            "script": str(script),
+            "interpreter": "~/workspace/.venv/bin/python3",
+        }
+
+        with patch("cron.scheduler._run_job_script", return_value=(True, "ok")) as mock_run:
+            prompt = _build_job_prompt(job)
+
+        mock_run.assert_called_once_with(str(script), interpreter="~/workspace/.venv/bin/python3")
+        assert "## Script Output" in prompt
+
     def test_script_error_injected(self, cron_env):
         from cron.scheduler import _build_job_prompt
 
@@ -229,7 +286,7 @@ class TestBuildJobPromptWithScript:
 
 
 class TestCronjobToolScript:
-    """Test the cronjob tool's script parameter."""
+    """Test the cronjob tool's script execution parameters."""
 
     def test_create_with_script(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
@@ -243,6 +300,21 @@ class TestCronjobToolScript:
         ))
         assert result["success"] is True
         assert result["job"]["script"] == "monitor.py"
+
+    def test_create_with_script_interpreter(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+            script="monitor.py",
+            interpreter="~/workspace/.venv/bin/python3",
+        ))
+        assert result["success"] is True
+        assert result["job"]["script"] == "monitor.py"
+        assert result["job"]["interpreter"] == "~/workspace/.venv/bin/python3"
 
     def test_update_script(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
@@ -262,6 +334,47 @@ class TestCronjobToolScript:
         ))
         assert update_result["success"] is True
         assert update_result["job"]["script"] == "new_script.py"
+
+    def test_update_script_interpreter(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        create_result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+            script="monitor.py",
+        ))
+        job_id = create_result["job_id"]
+
+        update_result = json.loads(cronjob(
+            action="update",
+            job_id=job_id,
+            interpreter="~/workspace/.venv/bin/python3",
+        ))
+        assert update_result["success"] is True
+        assert update_result["job"]["interpreter"] == "~/workspace/.venv/bin/python3"
+
+    def test_clear_script_interpreter(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        create_result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+            script="monitor.py",
+            interpreter="~/workspace/.venv/bin/python3",
+        ))
+        job_id = create_result["job_id"]
+
+        update_result = json.loads(cronjob(
+            action="update",
+            job_id=job_id,
+            interpreter="",
+        ))
+        assert update_result["success"] is True
+        assert "interpreter" not in update_result["job"]
 
     def test_clear_script(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
@@ -514,6 +627,37 @@ class TestCronjobToolScriptValidation:
             script="C:\\Users\\evil\\script.py",
         ))
         assert result["success"] is False
+
+
+class TestRunJobScriptInterpreterIntegration:
+    """Regression tests for interpreter propagation through run_job()."""
+
+    def test_run_job_wake_gate_passes_interpreter(self, cron_env):
+        from cron.scheduler import SILENT_MARKER, run_job
+
+        job = {
+            "id": "abc123def456",
+            "name": "wake-gated-job",
+            "prompt": "Report status.",
+            "schedule_display": "every 1h",
+            "script": "gate.py",
+            "interpreter": "~/workspace/.venv/bin/python3",
+        }
+
+        with patch(
+            "cron.scheduler._run_job_script",
+            return_value=(True, '{"wakeAgent": false}'),
+        ) as mock_run:
+            success, output, final_response, error = run_job(job)
+
+        mock_run.assert_called_once_with(
+            "gate.py",
+            interpreter="~/workspace/.venv/bin/python3",
+        )
+        assert success is True
+        assert "wakeAgent=false" in output
+        assert final_response == SILENT_MARKER
+        assert error is None
 
 
 class TestRunJobEnvVarCleanup:
