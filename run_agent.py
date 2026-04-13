@@ -2348,6 +2348,44 @@ class AIAgent:
             "api_mode": getattr(self, "api_mode", "") or "",
         }
 
+    def _get_custom_provider_model_config(self) -> Optional[Dict[str, Any]]:
+        """Return the active custom_providers per-model config when available."""
+        config = getattr(self, "config", None)
+        config = config if isinstance(config, dict) else {}
+        custom_providers = config.get("custom_providers")
+        if not isinstance(custom_providers, list):
+            return None
+
+        active_base_url = str(getattr(self, "base_url", "") or "").rstrip("/")
+        active_model = str(getattr(self, "model", "") or "")
+        active_model_lower = active_model.lower()
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            entry_base_url = str(entry.get("base_url") or "").rstrip("/")
+            if not entry_base_url or entry_base_url != active_base_url:
+                continue
+            models_cfg = entry.get("models")
+            if not isinstance(models_cfg, dict):
+                return None
+            model_cfg = models_cfg.get(active_model)
+            if isinstance(model_cfg, dict):
+                return model_cfg
+            for model_name, candidate in models_cfg.items():
+                if isinstance(model_name, str) and model_name.lower() == active_model_lower and isinstance(candidate, dict):
+                    return candidate
+            return None
+        return None
+
+    def _get_custom_provider_capability_override(self, capability: str) -> Optional[bool]:
+        model_cfg = self._get_custom_provider_model_config()
+        if not isinstance(model_cfg, dict):
+            return None
+        caps = model_cfg.get("capabilities")
+        if not isinstance(caps, dict) or capability not in caps:
+            return None
+        return bool(caps.get(capability))
+
     def _check_compression_model_feasibility(self) -> None:
         """Warn at session start if the auxiliary compression model's context
         window is smaller than the main model's compression threshold.
@@ -7498,7 +7536,10 @@ class AIAgent:
         Some providers/routes reject `reasoning` with 400s, so gate it to
         known reasoning-capable model families and direct Nous Portal.
         """
-        if base_url_host_matches(self._base_url_lower, "nousresearch.com"):
+        custom_override = self._get_custom_provider_capability_override("reasoning")
+        if custom_override is not None:
+            return custom_override
+        if base_url_host_matches(self._base_url_lower, "nousresearch.com") or "nousresearch" in self._base_url_lower:
             return True
         if base_url_host_matches(self._base_url_lower, "ai-gateway.vercel.sh"):
             return True

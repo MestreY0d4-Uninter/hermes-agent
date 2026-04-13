@@ -2234,7 +2234,11 @@ _KNOWN_ROOT_KEYS = {
 # Valid fields inside a custom_providers list entry
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
-    "context_length", "rate_limit_delay",
+    "context_length", "rate_limit_delay", "capabilities",
+}
+
+_VALID_CUSTOM_PROVIDER_CAPABILITY_FIELDS = {
+    "vision", "reasoning", "tools", "streaming",
 }
 
 # Fields that look like they should be inside custom_providers, not at root
@@ -2310,6 +2314,23 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                         f"custom_providers[{i}] is missing 'base_url' field",
                         "Add the API endpoint URL, e.g.: base_url: https://api.example.com/v1",
                     ))
+                models_cfg = entry.get("models")
+                if isinstance(models_cfg, dict):
+                    for model_name, model_cfg in models_cfg.items():
+                        if not isinstance(model_cfg, dict):
+                            continue
+                        capabilities_cfg = model_cfg.get("capabilities")
+                        if not isinstance(capabilities_cfg, dict):
+                            continue
+                        unknown_caps = sorted(
+                            set(capabilities_cfg.keys()) - _VALID_CUSTOM_PROVIDER_CAPABILITY_FIELDS
+                        )
+                        if unknown_caps:
+                            issues.append(ConfigIssue(
+                                "warning",
+                                f"custom_providers[{i}].models[{model_name!r}].capabilities has unknown capability key(s): {unknown_caps}",
+                                "Supported capability keys are: vision, reasoning, tools, streaming",
+                            ))
 
     # ── fallback_model must be a top-level dict with provider + model ────
     fb = config.get("fallback_model")

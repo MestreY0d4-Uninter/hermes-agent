@@ -911,10 +911,20 @@ def switch_model(
         base_url = re.sub(r"/v1/?$", "", base_url)
 
     # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model)
+    capabilities = get_model_capabilities(
+        target_provider,
+        new_model,
+        custom_providers=custom_providers,
+        base_url=base_url,
+    )
 
     # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model)
+    model_info = get_model_info(
+        target_provider,
+        new_model,
+        custom_providers=custom_providers,
+        base_url=base_url,
+    )
 
     # --- Collect warnings ---
     warnings: list[str] = []

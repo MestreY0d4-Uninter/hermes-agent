@@ -58,11 +58,44 @@ class TestCustomProvidersValidation:
         """Properly formatted custom_providers should produce no issues."""
         issues = validate_config_structure({
             "custom_providers": [
-                {"name": "gemini", "base_url": "https://example.com/v1"},
+                {
+                    "name": "gemini",
+                    "base_url": "https://example.com/v1",
+                    "models": {
+                        "gemini-2.5-pro": {
+                            "capabilities": {
+                                "vision": True,
+                                "reasoning": True,
+                                "tools": True,
+                                "streaming": True,
+                            }
+                        }
+                    },
+                },
             ],
             "model": {"provider": "custom", "default": "test"},
         })
         assert len(issues) == 0
+
+    def test_unknown_capability_key_warns(self):
+        issues = validate_config_structure({
+            "custom_providers": [
+                {
+                    "name": "local-vllm",
+                    "base_url": "https://example.com/v1",
+                    "models": {
+                        "my-model": {
+                            "capabilities": {
+                                "vision": True,
+                                "telepathy": True,
+                            }
+                        }
+                    },
+                }
+            ],
+            "model": {"provider": "custom", "default": "my-model"},
+        })
+        assert any("unknown capability" in i.message.lower() for i in issues)
 
     def test_list_entry_missing_name(self):
         """List entry without name should warn."""

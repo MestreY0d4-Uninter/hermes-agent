@@ -1252,6 +1252,52 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert "reasoning" not in kwargs.get("extra_body", {})
 
+    def test_reasoning_sent_for_custom_provider_capability_override(self, agent):
+        agent.base_url = "http://localhost:8000/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "custom"
+        agent.model = "my-reasoning-model"
+        agent.config = {
+            "custom_providers": [
+                {
+                    "name": "my-local-vllm",
+                    "base_url": "http://localhost:8000/v1",
+                    "models": {
+                        "my-reasoning-model": {
+                            "capabilities": {
+                                "reasoning": True,
+                            }
+                        }
+                    },
+                }
+            ]
+        }
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["extra_body"]["reasoning"]["effort"] == "medium"
+
+    def test_reasoning_override_matches_custom_provider_base_url_not_name(self, agent):
+        agent.base_url = "http://localhost:8000/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "custom"
+        agent.model = "my-reasoning-model"
+        agent.config = {
+            "custom_providers": [
+                {
+                    "name": "different-display-name",
+                    "base_url": "http://localhost:8000/v1",
+                    "models": {
+                        "my-reasoning-model": {
+                            "capabilities": {
+                                "reasoning": True,
+                            }
+                        }
+                    },
+                }
+            ]
+        }
+        assert agent._supports_reasoning_extra_body() is True
+
     def test_max_tokens_injected(self, agent):
         agent.max_tokens = 4096
         messages = [{"role": "user", "content": "hi"}]
