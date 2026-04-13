@@ -342,8 +342,8 @@ def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
                         "auth_type": "oauth",
                         "priority": 0,
                         "source": "device_code",
-                        "access_token": "access-old",
-                        "refresh_token": "refresh-old",
+                        "access_token": "***",
+                        "refresh_token": "***",
                         "base_url": "https://chatgpt.com/backend-api/codex",
                     },
                     {
@@ -352,8 +352,8 @@ def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
                         "auth_type": "oauth",
                         "priority": 1,
                         "source": "device_code",
-                        "access_token": "access-other",
-                        "refresh_token": "refresh-other",
+                        "access_token": "***",
+                        "refresh_token": "***",
                         "base_url": "https://chatgpt.com/backend-api/codex",
                     },
                 ]
@@ -384,8 +384,139 @@ def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
     primary, secondary = auth_payload["credential_pool"]["openai-codex"]
     assert primary["access_token"] == "access-new"
     assert primary["refresh_token"] == "refresh-new"
-    assert secondary["access_token"] == "access-other"
-    assert secondary["refresh_token"] == "refresh-other"
+    assert secondary["access_token"] == "***"
+    assert secondary["refresh_token"] == "***"
+
+
+def test_codex_cli_sync_rejects_mismatched_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "pool-access",
+                        "refresh_token": "pool-refresh",
+                    }
+                ]
+            },
+        },
+    )
+
+    monkeypatch.setattr(
+        "agent.credential_pool._import_codex_cli_tokens",
+        lambda: {
+            "access_token": "cli-access",
+            "refresh_token": "cli-refresh",
+            "account_id": "acct-cli",
+            "id_token": "id-token-cli",
+        },
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._extract_codex_identity_from_id_token",
+        lambda token: {"account_id": "acct-cli", "user_id": "user-cli"},
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._extract_pool_codex_identity",
+        lambda entry: {"account_id": "acct-pool", "user_id": "user-pool"},
+    )
+
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    pool = CredentialPool(
+        "openai-codex",
+        [
+            PooledCredential(
+                provider="openai-codex",
+                id="cred-1",
+                label="primary",
+                auth_type="oauth",
+                priority=0,
+                source="device_code",
+                access_token="pool-access",
+                refresh_token="pool-refresh",
+            )
+        ],
+    )
+    entry = pool.entries()[0]
+    synced = pool._sync_codex_entry_from_cli(entry)
+
+    assert synced is entry
+    assert synced.access_token == "pool-access"
+    assert synced.refresh_token == "pool-refresh"
+
+
+def test_codex_cli_sync_allows_verified_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "pool-access",
+                        "refresh_token": "pool-refresh",
+                    }
+                ]
+            },
+        },
+    )
+
+    monkeypatch.setattr(
+        "agent.credential_pool._import_codex_cli_tokens",
+        lambda: {
+            "access_token": "cli-access",
+            "refresh_token": "cli-refresh",
+            "account_id": "acct-123",
+            "id_token": "id-token-cli",
+        },
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._extract_codex_identity_from_id_token",
+        lambda token: {"account_id": "acct-123", "user_id": "user-123"},
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._extract_pool_codex_identity",
+        lambda entry: {"account_id": "acct-123", "user_id": "user-123"},
+    )
+
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    pool = CredentialPool(
+        "openai-codex",
+        [
+            PooledCredential(
+                provider="openai-codex",
+                id="cred-1",
+                label="primary",
+                auth_type="oauth",
+                priority=0,
+                source="device_code",
+                access_token="pool-access",
+                refresh_token="pool-refresh",
+            )
+        ],
+    )
+    entry = pool.entries()[0]
+    synced = pool._sync_codex_entry_from_cli(entry)
+
+    assert synced is not entry
+    assert synced.access_token == "cli-access"
+    assert synced.refresh_token == "cli-refresh"
+
 
 
 def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
@@ -1091,3 +1222,72 @@ def test_release_lease_decrements_counter(tmp_path, monkeypatch):
 
     pool.release_lease("cred-1")
     assert pool.active_lease_count("cred-1") == 0
+
+
+def test_mark_success_updates_pool_entry_and_persists(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 10,
+                        "last_error_code": 402,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    entry = pool.entries()[0]
+    assert entry.last_status == "exhausted"
+
+    updated = pool.mark_success(entry.id)
+    assert updated is not None
+    assert updated.last_status == "ok"
+    assert updated.last_error_code is None
+    assert updated.last_error_reason is None
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openrouter"][0]
+    assert persisted["last_status"] == "ok"
+    assert persisted["last_error_code"] is None
+
+
+def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured(tmp_path, monkeypatch):
+    """Claude Code credentials must not be auto-seeded when the user never selected anthropic."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
+
+    # Claude Code credentials exist on disk
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: {"accessToken": "sk-ant...oken", "refreshToken": "rt", "expiresAt": 9999999999999},
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials",
+        lambda: None,
+    )
+    # User configured kimi-coding, NOT anthropic
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_provider_explicitly_configured",
+        lambda pid: pid == "kimi-coding",
+    )
+
+    from agent.credential_pool import load_pool
+    pool = load_pool("anthropic")
+
+    # Should NOT have seeded the claude_code entry
+    assert pool.entries() == []
