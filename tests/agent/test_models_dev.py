@@ -284,3 +284,78 @@ class TestGetModelCapabilities:
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
             caps = get_model_capabilities("anthropic", "nonexistent-model")
         assert caps is None
+
+    def test_custom_provider_capabilities_override_without_models_dev_entry(self):
+        """custom_providers should be able to declare capabilities for private models."""
+        with patch("agent.models_dev.fetch_models_dev", return_value={}):
+            caps = get_model_capabilities(
+                "custom:my-local-vllm",
+                "my-llava-model",
+                custom_providers=[
+                    {
+                        "name": "My Local VLLM",
+                        "base_url": "http://localhost:8000/v1",
+                        "models": {
+                            "my-llava-model": {
+                                "context_length": 8192,
+                                "capabilities": {
+                                    "vision": True,
+                                    "reasoning": False,
+                                    "tools": True,
+                                    "streaming": True,
+                                },
+                            }
+                        },
+                    }
+                ],
+            )
+
+        assert caps is not None
+        assert caps.supports_vision is True
+        assert caps.supports_reasoning is False
+        assert caps.supports_tools is True
+        assert caps.supports_streaming is True
+        assert caps.context_window == 8192
+
+    def test_custom_provider_capabilities_override_merges_with_models_dev_defaults(self):
+        """Declared capabilities should override only the fields present in config."""
+        registry = {
+            "openai": {
+                "id": "openai",
+                "models": {
+                    "gpt-4.1": {
+                        "id": "gpt-4.1",
+                        "reasoning": True,
+                        "tool_call": False,
+                        "attachment": False,
+                        "limit": {"context": 128000, "output": 8192},
+                    }
+                },
+            }
+        }
+
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            caps = get_model_capabilities(
+                "openai",
+                "gpt-4.1",
+                custom_providers=[
+                    {
+                        "name": "Mirror",
+                        "base_url": "https://mirror.example.com/v1",
+                        "models": {
+                            "gpt-4.1": {
+                                "capabilities": {
+                                    "tools": True,
+                                }
+                            }
+                        },
+                    }
+                ],
+                base_url="https://mirror.example.com/v1",
+            )
+
+        assert caps is not None
+        assert caps.supports_tools is True
+        assert caps.supports_reasoning is True
+        assert caps.supports_vision is False
+        assert caps.context_window == 128000

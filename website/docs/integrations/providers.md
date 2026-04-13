@@ -1007,6 +1007,13 @@ Hermes uses a multi-source resolution chain to detect the correct context window
 8. **[models.dev](https://models.dev)** — community-maintained registry with provider-specific context lengths for 3800+ models across 100+ providers
 9. **Fallback defaults** — broad model family patterns (128K default)
 
+For capability detection (vision / reasoning / tool-calling), Hermes uses a similar precedence:
+
+1. **Custom provider per-model capability override** — `custom_providers[].models.<id>.capabilities`
+2. **[models.dev](https://models.dev)** metadata
+3. **Built-in runtime heuristics** (for provider-specific cases like OpenRouter reasoning routes)
+4. **Conservative defaults**
+
 For most setups this works out of the box. The system is provider-aware — the same model can have different context limits depending on who serves it (e.g., `claude-opus-4.6` is 1M on Anthropic direct but 128K on GitHub Copilot).
 
 To set the context length explicitly, add `context_length` to your model config:
@@ -1018,7 +1025,7 @@ model:
   context_length: 131072  # tokens
 ```
 
-For custom endpoints, you can also set context length per model:
+For custom endpoints, you can also set context length and declared capabilities per model:
 
 ```yaml
 custom_providers:
@@ -1027,8 +1034,17 @@ custom_providers:
     models:
       qwen3.5:27b:
         context_length: 32768
+        capabilities:
+          vision: false
+          reasoning: true
+          tools: true
+          streaming: true
       deepseek-r1:70b:
         context_length: 65536
+        capabilities:
+          vision: false
+          reasoning: true
+          tools: true
 ```
 
 `hermes model` will prompt for context length when configuring a custom endpoint. Leave it blank for auto-detection.

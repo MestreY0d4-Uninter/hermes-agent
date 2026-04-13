@@ -313,9 +313,120 @@ class ModelCapabilities:
     supports_tools: bool = True
     supports_vision: bool = False
     supports_reasoning: bool = False
+    supports_streaming: bool = True
     context_window: int = 200000
     max_output_tokens: int = 8192
     model_family: str = ""
+
+
+
+def _normalize_custom_provider_slug(name: str) -> str:
+    return "custom:" + str(name or "").strip().lower().replace(" ", "-")
+
+
+def _custom_provider_base_url_matches(entry: Dict[str, Any], base_url: Optional[str]) -> bool:
+    if not isinstance(entry, dict) or not base_url:
+        return False
+    entry_url = str(entry.get("base_url") or "").rstrip("/")
+    return bool(entry_url) and entry_url == str(base_url or "").rstrip("/")
+
+
+def _find_custom_provider_model_config(
+    custom_providers: Optional[List[Dict[str, Any]]],
+    provider: str,
+    model: str,
+    *,
+    base_url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not custom_providers or not isinstance(custom_providers, list):
+        return None
+
+    provider_slug = str(provider or "").strip().lower()
+    model_name = str(model or "")
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+
+        matches_provider = False
+        if _custom_provider_base_url_matches(entry, base_url):
+            matches_provider = True
+        elif provider_slug.startswith("custom:"):
+            matches_provider = _normalize_custom_provider_slug(str(entry.get("name") or "")) == provider_slug
+
+        if not matches_provider:
+            continue
+
+        models_cfg = entry.get("models")
+        if not isinstance(models_cfg, dict):
+            return None
+
+        direct = models_cfg.get(model_name)
+        if isinstance(direct, dict):
+            return direct
+
+        model_lower = model_name.lower()
+        for mid, cfg in models_cfg.items():
+            if isinstance(mid, str) and mid.lower() == model_lower and isinstance(cfg, dict):
+                return cfg
+        return None
+
+    return None
+
+
+def _apply_custom_capability_overrides(
+    caps: ModelCapabilities,
+    custom_model_cfg: Optional[Dict[str, Any]],
+) -> ModelCapabilities:
+    if not isinstance(custom_model_cfg, dict):
+        return caps
+
+    ctx = custom_model_cfg.get("context_length")
+    if isinstance(ctx, (int, float)) and ctx > 0:
+        caps.context_window = int(ctx)
+
+    overrides = custom_model_cfg.get("capabilities")
+    if not isinstance(overrides, dict):
+        return caps
+
+    if "vision" in overrides:
+        caps.supports_vision = bool(overrides.get("vision"))
+    if "reasoning" in overrides:
+        caps.supports_reasoning = bool(overrides.get("reasoning"))
+    if "tools" in overrides:
+        caps.supports_tools = bool(overrides.get("tools"))
+    if "streaming" in overrides:
+        caps.supports_streaming = bool(overrides.get("streaming"))
+    return caps
+
+
+def _model_info_from_capabilities(
+    provider_id: str,
+    model_id: str,
+    caps: ModelCapabilities,
+) -> ModelInfo:
+    return ModelInfo(
+        id=model_id,
+        name=model_id,
+        family=caps.model_family or model_id,
+        provider_id=provider_id,
+        reasoning=caps.supports_reasoning,
+        tool_call=caps.supports_tools,
+        attachment=caps.supports_vision,
+        context_window=caps.context_window,
+        max_output=caps.max_output_tokens,
+    )
+
+
+def _apply_capability_overrides_to_model_info(
+    info: ModelInfo,
+    caps: ModelCapabilities,
+) -> ModelInfo:
+    info.reasoning = caps.supports_reasoning
+    info.tool_call = caps.supports_tools
+    info.attachment = caps.supports_vision
+    info.context_window = caps.context_window
+    info.max_output = caps.max_output_tokens
+    return info
 
 
 def _get_provider_models(provider: str) -> Optional[Dict[str, Any]]:
@@ -355,7 +466,13 @@ def _find_model_entry(models: Dict[str, Any], model: str) -> Optional[Dict[str, 
     return None
 
 
-def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilities]:
+def get_model_capabilities(
+    provider: str,
+    model: str,
+    *,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    base_url: Optional[str] = None,
+) -> Optional[ModelCapabilities]:
     """Look up full capability metadata from models.dev cache.
 
     Uses the existing fetch_models_dev() and PROVIDER_TO_MODELS_DEV mapping.
@@ -369,47 +486,52 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
       - limit.output  (int) → max_output_tokens
       - family     (str)   → model_family
     """
-    models = _get_provider_models(provider)
-    if models is None:
-        return None
-
-    entry = _find_model_entry(models, model)
-    if entry is None:
-        return None
-
-    # Extract capability flags (default to False if missing)
-    supports_tools = bool(entry.get("tool_call", False))
-    # Vision: check both the `attachment` flag and `modalities.input` for "image".
-    # Some models (e.g. gemma-4) list image in input modalities but not attachment.
-    input_mods = entry.get("modalities", {})
-    if isinstance(input_mods, dict):
-        input_mods = input_mods.get("input", [])
-    else:
-        input_mods = []
-    supports_vision = bool(entry.get("attachment", False)) or "image" in input_mods
-    supports_reasoning = bool(entry.get("reasoning", False))
-
-    # Extract limits
-    limit = entry.get("limit", {})
-    if not isinstance(limit, dict):
-        limit = {}
-
-    ctx = limit.get("context")
-    context_window = int(ctx) if isinstance(ctx, (int, float)) and ctx > 0 else 200000
-
-    out = limit.get("output")
-    max_output_tokens = int(out) if isinstance(out, (int, float)) and out > 0 else 8192
-
-    model_family = entry.get("family", "") or ""
-
-    return ModelCapabilities(
-        supports_tools=supports_tools,
-        supports_vision=supports_vision,
-        supports_reasoning=supports_reasoning,
-        context_window=context_window,
-        max_output_tokens=max_output_tokens,
-        model_family=model_family,
+    custom_model_cfg = _find_custom_provider_model_config(
+        custom_providers,
+        provider,
+        model,
+        base_url=base_url,
     )
+
+    models = _get_provider_models(provider)
+    entry = _find_model_entry(models, model) if models is not None else None
+
+    if entry is None and not isinstance(custom_model_cfg, dict):
+        return None
+
+    if isinstance(entry, dict):
+        supports_tools = bool(entry.get("tool_call", False))
+        input_mods = entry.get("modalities", {})
+        if isinstance(input_mods, dict):
+            input_mods = input_mods.get("input", [])
+        else:
+            input_mods = []
+        supports_vision = bool(entry.get("attachment", False)) or "image" in input_mods
+        supports_reasoning = bool(entry.get("reasoning", False))
+
+        limit = entry.get("limit", {})
+        if not isinstance(limit, dict):
+            limit = {}
+
+        ctx = limit.get("context")
+        context_window = int(ctx) if isinstance(ctx, (int, float)) and ctx > 0 else 200000
+
+        out = limit.get("output")
+        max_output_tokens = int(out) if isinstance(out, (int, float)) and out > 0 else 8192
+
+        model_family = entry.get("family", "") or ""
+        caps = ModelCapabilities(
+            supports_tools=supports_tools,
+            supports_vision=supports_vision,
+            supports_reasoning=supports_reasoning,
+            context_window=context_window,
+            max_output_tokens=max_output_tokens,
+            model_family=model_family,
+        )
+    else:
+        caps = ModelCapabilities(model_family=model)
+
+    return _apply_custom_capability_overrides(caps, custom_model_cfg)
 
 
 def list_provider_models(provider: str) -> List[str]:
@@ -594,7 +716,11 @@ def get_provider_info(provider_id: str) -> Optional[ProviderInfo]:
 # ---------------------------------------------------------------------------
 
 def get_model_info(
-    provider_id: str, model_id: str
+    provider_id: str,
+    model_id: str,
+    *,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    base_url: Optional[str] = None,
 ) -> Optional[ModelInfo]:
     """Get full model metadata from models.dev.
 
@@ -605,22 +731,28 @@ def get_model_info(
 
     data = fetch_models_dev()
     pdata = data.get(mdev_id)
-    if not isinstance(pdata, dict):
-        return None
+    raw_info: Optional[ModelInfo] = None
+    if isinstance(pdata, dict):
+        models = pdata.get("models", {})
+        if isinstance(models, dict):
+            raw = models.get(model_id)
+            if isinstance(raw, dict):
+                raw_info = _parse_model_info(model_id, raw, mdev_id)
+            else:
+                model_lower = model_id.lower()
+                for mid, mdata in models.items():
+                    if mid.lower() == model_lower and isinstance(mdata, dict):
+                        raw_info = _parse_model_info(mid, mdata, mdev_id)
+                        break
 
-    models = pdata.get("models", {})
-    if not isinstance(models, dict):
-        return None
-
-    # Exact match
-    raw = models.get(model_id)
-    if isinstance(raw, dict):
-        return _parse_model_info(model_id, raw, mdev_id)
-
-    # Case-insensitive fallback
-    model_lower = model_id.lower()
-    for mid, mdata in models.items():
-        if mid.lower() == model_lower and isinstance(mdata, dict):
-            return _parse_model_info(mid, mdata, mdev_id)
-
-    return None
+    caps = get_model_capabilities(
+        provider_id,
+        model_id,
+        custom_providers=custom_providers,
+        base_url=base_url,
+    )
+    if caps is None:
+        return raw_info
+    if raw_info is None:
+        return _model_info_from_capabilities(provider_id, model_id, caps)
+    return _apply_capability_overrides_to_model_info(raw_info, caps)
