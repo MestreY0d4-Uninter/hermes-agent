@@ -307,6 +307,40 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
 
 
+def test_cmd_update_uses_uv_sync_when_lockfile_exists(monkeypatch, tmp_path):
+    """Update should finish dependency sync during the update phase when uv.lock exists."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    recorded = []
+
+    def fake_run(cmd, **kwargs):
+        recorded.append((cmd, kwargs))
+        if cmd == ["git", "fetch", "origin"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "pull", "origin", "main"]:
+            return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
+        if cmd == ["/usr/bin/uv", "sync", "--all-extras", "--locked"]:
+            return SimpleNamespace(stdout="synced\n", stderr="", returncode=0)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    sync_calls = [(cmd, kwargs) for cmd, kwargs in recorded if cmd == ["/usr/bin/uv", "sync", "--all-extras", "--locked"]]
+    assert len(sync_calls) == 1
+    assert sync_calls[0][1]["env"]["UV_PROJECT_ENVIRONMENT"] == str(tmp_path / "venv")
+
+    pip_installs = [cmd for cmd, _kwargs in recorded if cmd[:3] == ["/usr/bin/uv", "pip", "install"]]
+    assert pip_installs == []
+
+
 def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypatch, tmp_path, capsys):
     """When .[all] fails, update should keep base deps and retry extras individually."""
     _setup_update_mocks(monkeypatch, tmp_path)
