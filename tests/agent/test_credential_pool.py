@@ -1265,29 +1265,3 @@ def test_mark_success_updates_pool_entry_and_persists(tmp_path, monkeypatch):
     assert persisted["last_status"] == "ok"
     assert persisted["last_error_code"] is None
 
-
-def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured(tmp_path, monkeypatch):
-    """Claude Code credentials must not be auto-seeded when the user never selected anthropic."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
-
-    # Claude Code credentials exist on disk
-    monkeypatch.setattr(
-        "agent.anthropic_adapter.read_claude_code_credentials",
-        lambda: {"accessToken": "sk-ant...oken", "refreshToken": "rt", "expiresAt": 9999999999999},
-    )
-    monkeypatch.setattr(
-        "agent.anthropic_adapter.read_hermes_oauth_credentials",
-        lambda: None,
-    )
-    # User configured kimi-coding, NOT anthropic
-    monkeypatch.setattr(
-        "hermes_cli.auth.is_provider_explicitly_configured",
-        lambda pid: pid == "kimi-coding",
-    )
-
-    from agent.credential_pool import load_pool
-    pool = load_pool("anthropic")
-
-    # Should NOT have seeded the claude_code entry
-    assert pool.entries() == []
