@@ -223,6 +223,22 @@ class TestNonStringContent:
         }
 
 
+class TestContextLengthResolution:
+    def test_constructor_passes_api_mode_to_context_lookup(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000) as mock_ctx:
+            ContextCompressor(
+                model="claude-sonnet-4.6",
+                provider="copilot",
+                base_url="https://api.githubcopilot.com",
+                api_key="copilot-token",
+                api_mode="anthropic_messages",
+                quiet_mode=True,
+            )
+
+        assert mock_ctx.call_args.kwargs["api_mode"] == "anthropic_messages"
+        assert mock_ctx.call_args.kwargs["provider"] == "copilot"
+
+
 class TestSummaryFailureCooldown:
     def test_summary_failure_enters_cooldown_and_skips_retry(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):

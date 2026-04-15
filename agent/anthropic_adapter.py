@@ -347,7 +347,11 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     if not normalized:
         return False
     normalized = normalized.rstrip("/").lower()
-    return normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
+    return normalized.startswith((
+        "https://api.minimax.io/anthropic",
+        "https://api.minimaxi.com/anthropic",
+        "https://api.githubcopilot.com",
+    ))
 
 
 def _common_betas_for_base_url(base_url: str | None) -> list[str]:
@@ -412,6 +416,13 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
         kwargs["auth_token"] = api_key
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+        if "githubcopilot.com" in normalized_base_url:
+            from hermes_cli.models import copilot_default_headers
+
+            kwargs["default_headers"] = {
+                **kwargs.get("default_headers", {}),
+                **copilot_default_headers(),
+            }
     elif _is_third_party_anthropic_endpoint(base_url):
         # Third-party proxies (Azure AI Foundry, AWS Bedrock, etc.) use their
         # own API keys with x-api-key auth. Skip OAuth detection — their keys
