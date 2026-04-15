@@ -874,6 +874,59 @@ def _normalize_model_version(model: str) -> str:
     return model.replace(".", "-")
 
 
+def _anthropic_context_for_model(model: str) -> Optional[int]:
+    """Return Anthropic's context window for a Claude model.
+
+    Source: https://platform.claude.com/docs/en/about-claude/models/overview
+    Used when Copilot routes via /v1/messages (Anthropic format) — the real
+    limit is Anthropic's, not the Copilot catalog's conservative value.
+    """
+    _model = model.lower().replace("-", "-")
+    # Anthropic uses dashes (claude-opus-4-6), Copilot uses dots (claude-opus-4.6)
+    _families = {
+        "claude-sonnet-4-6": 1_000_000,
+        "claude-haiku-4-5": 200_000,
+        "claude-opus-4-5": 200_000,
+        "claude-sonnet-4-5": 200_000,
+    }
+    # Normalize dots to dashes for matching
+    _normalized = _model.replace(".", "-")
+    for family, ctx in _families.items():
+        if _normalized.startswith(family):
+            return ctx
+    logger.warning(
+        "Copilot Claude model %r not in Anthropic context lookup — "
+        "context window may be incorrect. Supported: %s",
+        model, ", ".join(_families.keys()),
+    )
+    return None
+
+
+def _query_copilot_context_length(model: str, api_key: str) -> Optional[int]:
+    """Query Copilot's /models endpoint for exact context length per model variant.
+
+    The Copilot catalog reports precise limits (e.g. opus-4.6=144k,
+    opus-4.6-1m=1M, sonnet-4.6=200k) in capabilities.limits.
+    """
+    try:
+        from hermes_cli.models import fetch_github_model_catalog
+        catalog = fetch_github_model_catalog(api_key=api_key or None)
+        if not catalog:
+            return None
+        for item in catalog:
+            if item.get("id") != model:
+                continue
+            capabilities = item.get("capabilities") or {}
+            limits = capabilities.get("limits") or {}
+            ctx = limits.get("max_context_window_tokens")
+            if isinstance(ctx, int) and ctx > 0:
+                return ctx
+            break
+    except Exception as e:
+        logger.debug("Copilot /models query failed: %s", e)
+    return None
+
+
 def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> Optional[int]:
     """Query Anthropic's /v1/models endpoint for context length.
 
@@ -944,24 +997,35 @@ def get_model_context_length(
     api_key: str = "",
     config_context_length: int | None = None,
     provider: str = "",
+    api_mode: str = "",
 ) -> int:
     """Get the context length for a model.
 
     Resolution order:
     0. Explicit config override (model.context_length or custom_providers per-model)
+    0b. Anthropic context limits (when api_mode=anthropic_messages via Copilot)
     1. Persistent cache (previously discovered via probing)
     2. Active endpoint metadata (/models for explicit custom endpoints)
     3. Local server query (for local endpoints)
-    4. Anthropic /v1/models API (API-key users only, not OAuth)
-    5. OpenRouter live API metadata
-    6. Nous suffix-match via OpenRouter cache
-    7. models.dev registry lookup (provider-aware)
-    8. Thin hardcoded defaults (broad family patterns)
-    9. Default fallback (128K)
+    4. Copilot /models API (exact per-variant limits)
+    5. Anthropic /v1/models API (API-key users only, not OAuth)
+    6. Provider-aware lookups (models.dev)
+    7. OpenRouter live API metadata
+    8. Nous suffix-match via OpenRouter cache
+    9. Thin hardcoded defaults (broad family patterns)
+    10. Default fallback (128K)
     """
     # 0. Explicit config override — user knows best
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
+
+    # 0b. When Copilot routes Claude via Anthropic Messages API (/v1/messages),
+    # the actual context limit is Anthropic's, not Copilot's conservative value.
+    # Source: Anthropic official docs (platform.claude.com/docs/en/about-claude/models/overview).
+    if api_mode == "anthropic_messages" and provider in ("copilot", "github-copilot"):
+        ctx = _anthropic_context_for_model(model)
+        if ctx:
+            return ctx
 
     # Normalise provider-prefixed model names (e.g. "local:model-name" →
     # "model-name") so cache lookups and server queries use the bare ID that
@@ -1011,7 +1075,17 @@ def get_model_context_length(
             )
             return DEFAULT_FALLBACK_CONTEXT
 
-    # 4. Anthropic /v1/models API (only for regular API keys, not OAuth)
+    # 4. Copilot /models API — has exact context limits per model variant
+    # (e.g. opus-4.6=144k, opus-4.6-1m=1M, sonnet-4.6=200k).
+    _is_copilot = provider in ("copilot", "github-copilot") or (
+        base_url and "api.githubcopilot.com" in base_url
+    )
+    if _is_copilot:
+        ctx = _query_copilot_context_length(model, api_key)
+        if ctx:
+            return ctx
+
+    # 5. Anthropic /v1/models API (only for regular API keys, not OAuth)
     if provider == "anthropic" or (
         base_url and "api.anthropic.com" in base_url
     ):
@@ -1029,7 +1103,7 @@ def get_model_context_length(
         except ImportError:
             pass  # boto3 not installed — fall through to generic resolution
 
-    # 5. Provider-aware lookups (before generic OpenRouter cache)
+    # 6. Provider-aware lookups (before generic OpenRouter cache)
     # These are provider-specific and take priority over the generic OR cache,
     # since the same model can have different context limits per provider
     # (e.g. claude-opus-4.6 is 1M on Anthropic but 128K on GitHub Copilot).

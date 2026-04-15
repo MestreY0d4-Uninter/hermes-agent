@@ -11,6 +11,7 @@ from agent.prompt_caching import apply_anthropic_cache_control
 from agent.anthropic_adapter import (
     _is_oauth_token,
     _refresh_oauth_token,
+    _requires_bearer_auth,
     _to_plain_data,
     _write_claude_code_credentials,
     build_anthropic_client,
@@ -53,6 +54,22 @@ class TestIsOAuthToken:
 
     def test_empty(self):
         assert _is_oauth_token("") is False
+
+
+class TestRequiresBearerAuth:
+    def test_requires_bearer_auth_copilot(self):
+        assert _requires_bearer_auth("https://api.githubcopilot.com") is True
+        assert _requires_bearer_auth("https://api.githubcopilot.com/") is True
+        assert _requires_bearer_auth("https://api.githubcopilot.com/v1") is True
+        # MiniMax still works
+        assert _requires_bearer_auth("https://api.minimax.io/anthropic") is True
+        # Anthropic native should NOT be bearer-auth third-party
+        assert _requires_bearer_auth("https://api.anthropic.com") is False
+
+    def test_requires_bearer_auth_unrelated(self):
+        assert _requires_bearer_auth("https://api.openai.com/v1") is False
+        assert _requires_bearer_auth("") is False
+        assert _requires_bearer_auth(None) is False
 
 
 class TestBuildAnthropicClient:

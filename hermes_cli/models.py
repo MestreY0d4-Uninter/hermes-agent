@@ -1628,6 +1628,9 @@ def copilot_model_api_mode(
     if _should_use_copilot_responses_api(normalized):
         return "codex_responses"
 
+    if normalized.startswith("claude-"):
+        return "anthropic_messages"
+
     # Secondary: check catalog for non-GPT-5 models (Claude via /v1/messages, etc.)
     if catalog:
         catalog_entry = next((item for item in catalog if item.get("id") == normalized), None)

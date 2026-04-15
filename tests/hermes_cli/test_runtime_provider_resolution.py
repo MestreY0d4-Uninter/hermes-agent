@@ -57,6 +57,40 @@ def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkey
     assert resolved["base_url"] == "https://proxy.example.com/anthropic"
 
 
+def test_resolve_runtime_provider_copilot_pool_respects_config_base_url(monkeypatch):
+    class _Entry:
+        access_token = "pool-token"
+        source = "gh_cli"
+        base_url = ""
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "copilot")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "copilot",
+            "base_url": "https://api.githubcopilot.com",
+            "default": "claude-sonnet-4.6",
+            "api_mode": "anthropic_messages",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    resolved = rp.resolve_runtime_provider(requested="copilot")
+
+    assert resolved["provider"] == "copilot"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["api_key"] == "pool-token"
+    assert resolved["base_url"] == "https://api.githubcopilot.com"
+
+
 def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):
     def _unexpected_pool(provider):
         raise AssertionError(f"load_pool should not be called for {provider}")

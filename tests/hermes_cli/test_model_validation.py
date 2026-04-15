@@ -330,13 +330,27 @@ class TestCopilotNormalization:
         assert copilot_model_api_mode("gpt-5-mini") == "chat_completions"
 
     def test_copilot_api_mode_non_gpt5_uses_chat(self):
-        """Non-GPT-5 models use Chat Completions."""
+        """Non-GPT-5, non-Claude models use Chat Completions. Claude uses Anthropic Messages."""
         assert copilot_model_api_mode("gpt-4.1") == "chat_completions"
         assert copilot_model_api_mode("gpt-4o") == "chat_completions"
         assert copilot_model_api_mode("gpt-4o-mini") == "chat_completions"
-        assert copilot_model_api_mode("claude-sonnet-4.6") == "chat_completions"
-        assert copilot_model_api_mode("claude-opus-4.6") == "chat_completions"
         assert copilot_model_api_mode("gemini-2.5-pro") == "chat_completions"
+
+    def test_copilot_api_mode_claude_uses_anthropic_messages(self):
+        """Claude models on Copilot use Anthropic Messages API for full 1M context."""
+        assert copilot_model_api_mode("claude-sonnet-4.6") == "anthropic_messages"
+        assert copilot_model_api_mode("claude-opus-4.6") == "anthropic_messages"
+        assert copilot_model_api_mode("claude-haiku-4.5") == "anthropic_messages"
+
+    def test_copilot_api_mode_claude_1m_variant(self):
+        """claude-opus-4.6-1m variant should also use anthropic_messages."""
+        assert copilot_model_api_mode("claude-opus-4.6-1m") == "anthropic_messages"
+
+    def test_copilot_api_mode_older_claude(self):
+        """Older Claude models on Copilot should also use anthropic_messages."""
+        assert copilot_model_api_mode("claude-sonnet-4") == "anthropic_messages"
+        assert copilot_model_api_mode("claude-sonnet-4.5") == "anthropic_messages"
+        assert copilot_model_api_mode("claude-opus-4.5") == "anthropic_messages"
 
     def test_copilot_api_mode_with_catalog_both_endpoints(self):
         """When catalog shows both endpoints, model ID pattern wins."""

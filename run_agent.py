@@ -759,6 +759,15 @@ class AIAgent:
         elif self.provider == "bedrock" or "bedrock-runtime" in self._base_url_lower:
             # AWS Bedrock — auto-detect from provider name or base URL.
             self.api_mode = "bedrock_converse"
+        elif self.provider in ("copilot", "github-copilot"):
+            # Copilot Claude models use /v1/messages for full 1M context.
+            # GPT models stay on chat_completions (set by default below).
+            try:
+                from hermes_cli.models import copilot_model_api_mode
+                _resolved = copilot_model_api_mode(self.model)
+                self.api_mode = _resolved if _resolved in {"anthropic_messages", "codex_responses"} else "chat_completions"
+            except Exception:
+                self.api_mode = "chat_completions"
         else:
             self.api_mode = "chat_completions"
 
@@ -1516,6 +1525,7 @@ class AIAgent:
                 api_key=getattr(self, "api_key", ""),
                 config_context_length=_config_context_length,
                 provider=self.provider,
+                api_mode=getattr(self, "api_mode", ""),
             )
             self.context_compressor.update_model(
                 model=self.model,
@@ -1728,6 +1738,15 @@ class AIAgent:
         # ── Determine api_mode if not provided ──
         if not api_mode:
             api_mode = determine_api_mode(new_provider, base_url)
+            # Copilot Claude models should use Anthropic Messages API for full 1M context
+            if new_provider in ("copilot", "github-copilot") and api_mode == "chat_completions":
+                try:
+                    from hermes_cli.models import copilot_model_api_mode
+                    _resolved = copilot_model_api_mode(new_model)
+                    if _resolved in {"anthropic_messages", "codex_responses"}:
+                        api_mode = _resolved
+                except Exception:
+                    pass
 
         # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
         # /v1 into the anthropic_messages client, which would cause the SDK to
@@ -1803,6 +1822,7 @@ class AIAgent:
                 api_key=self.api_key,
                 provider=self.provider,
                 config_context_length=getattr(self, "_config_context_length", None),
+                api_mode=self.api_mode,
             )
             self.context_compressor.update_model(
                 model=self.model,
@@ -6371,7 +6391,7 @@ class AIAgent:
                 fb_api_mode = "anthropic_messages"
             elif self._is_direct_openai_url(fb_base_url):
                 fb_api_mode = "codex_responses"
-            elif self._provider_model_requires_responses_api(
+            if self._provider_model_requires_responses_api(
                 fb_model,
                 provider=fb_provider,
             ):
@@ -6381,6 +6401,15 @@ class AIAgent:
                 fb_api_mode = "codex_responses"
             elif fb_provider == "bedrock" or "bedrock-runtime" in fb_base_url.lower():
                 fb_api_mode = "bedrock_converse"
+            elif fb_provider in ("copilot", "github-copilot"):
+                # Copilot Claude models use /v1/messages for full 1M context
+                try:
+                    from hermes_cli.models import copilot_model_api_mode
+                    _resolved = copilot_model_api_mode(fb_model)
+                    if _resolved in {"anthropic_messages", "codex_responses"}:
+                        fb_api_mode = _resolved
+                except Exception:
+                    pass
 
             old_model = self.model
             self.model = fb_model
@@ -6437,6 +6466,7 @@ class AIAgent:
                 fb_context_length = get_model_context_length(
                     self.model, base_url=self.base_url,
                     api_key=self.api_key, provider=self.provider,
+                    api_mode=self.api_mode,
                 )
                 self.context_compressor.update_model(
                     model=self.model,
