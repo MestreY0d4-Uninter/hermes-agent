@@ -783,14 +783,18 @@ function renderNodeToOutput(
           // at max) otherwise leaves useVirtualScroll's clamp holding the
           // viewport short of new streaming content. scrollTo/scrollBy set
           // false; this restores true, same as scrollToBottom() would.
-          // Only restore when (a) positionally at bottom and (b) the flag
-          // was explicitly broken (===false) by scrollTo/scrollBy. When
-          // undefined (never set by user action) leave it alone — setting it
-          // would make the sticky flag sticky-by-default and lock out
-          // direct scrollTop writes (e.g. the alt-screen-perf test).
-          if (node.stickyScroll === false && scrollTopBeforeFollow >= prevMaxScroll) {
-            node.stickyScroll = true
-          }
+ // Only restore when (a) positionally at bottom and (b) the flag
+ // was explicitly broken (===false) by scrollTo/scrollBy. When
+ // undefined (never set by user action) leave it alone — setting it
+ // would make the sticky flag sticky-by-default and lock out
+ // direct scrollTop writes (e.g. the alt-screen-perf test).
+ // DON'T restore if user recently scrolled up (within 500ms) to
+ // prevent aggressive re-activation that fights user intent.
+ const now = Date.now()
+ const recentScrollUp = node.recentScrollUpTime && (now - node.recentScrollUpTime) < 500
+ if (node.stickyScroll === false && scrollTopBeforeFollow >= prevMaxScroll && !recentScrollUp) {
+ node.stickyScroll = true
+ }
         }
 
         const followDelta = (node.scrollTop ?? 0) - scrollTopBeforeFollow

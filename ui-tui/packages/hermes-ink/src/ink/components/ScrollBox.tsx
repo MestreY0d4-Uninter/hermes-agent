@@ -162,28 +162,34 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
           return
         }
 
-        el.stickyScroll = false
-        // Wheel input cancels any in-flight anchor seek — user override.
-        el.scrollAnchor = undefined
-        // Accumulate in pendingScrollDelta; renderer drains it at a capped
-        // rate so fast flicks show intermediate frames. Pure accumulator:
-        // scroll-up followed by scroll-down naturally cancels.
-        el.pendingScrollDelta = (el.pendingScrollDelta ?? 0) + Math.floor(dy)
-        scrollMutated(el)
-      },
-      scrollToBottom() {
-        const el = domRef.current
+			el.stickyScroll = false
+			// Wheel input cancels any in-flight anchor seek — user override.
+			el.scrollAnchor = undefined
+			// Mark recent scroll-up to prevent sticky re-activation
+			if (dy < 0) {
+				el.recentScrollUpTime = Date.now()
+			}
+			// Accumulate in pendingScrollDelta; renderer drains it at a capped
+			// rate so fast flicks show intermediate frames. Pure accumulator:
+			// scroll-up followed by scroll-down naturally cancels.
+			el.pendingScrollDelta = (el.pendingScrollDelta ?? 0) + Math.floor(dy)
+			scrollMutated(el)
+		},
+		scrollToBottom() {
+			const el = domRef.current
 
-        if (!el) {
-          return
-        }
+			if (!el) {
+				return
+			}
 
-        el.pendingScrollDelta = undefined
-        el.stickyScroll = true
-        markDirty(el)
-        notify()
-        forceRender(n => n + 1)
-      },
+			el.pendingScrollDelta = undefined
+			el.stickyScroll = true
+			// Clear recentScrollUpTime since we're explicitly going to bottom
+			el.recentScrollUpTime = undefined
+			markDirty(el)
+			notify()
+			forceRender(n => n + 1)
+		},
       getScrollTop() {
         return domRef.current?.scrollTop ?? 0
       },
