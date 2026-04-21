@@ -1981,7 +1981,6 @@ tts-premium = [
     { name = "elevenlabs" },
 ]
 voice = [
-    { name = "faster-whisper" },
     { name = "numpy" },
     { name = "sounddevice" },
 ]
