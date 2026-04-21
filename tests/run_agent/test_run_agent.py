@@ -523,6 +523,38 @@ class TestInit:
             assert agent.api_mode == "anthropic_messages"
             mock_anthropic.Anthropic.assert_called_once()
 
+    def test_copilot_sonnet_anthropic_messages_initializes_compressor_with_1m_context(self):
+        """Copilot Sonnet 4.6 should initialize compressor with Anthropic 1M limit.
+
+        Regression test for the startup bug where AIAgent correctly routed
+        Copilot Claude to ``anthropic_messages`` but ContextCompressor still
+        initialized from the Copilot catalog value (200k) because api_mode was
+        not forwarded into get_model_context_length().
+        """
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("agent.anthropic_adapter._anthropic_sdk") as mock_anthropic,
+            patch("agent.model_metadata._anthropic_context_for_model", return_value=1_000_000) as mock_anthropic_ctx,
+            patch("agent.model_metadata._query_copilot_context_length", return_value=200_000) as mock_copilot_ctx,
+        ):
+            agent = AIAgent(
+                model="claude-sonnet-4.6",
+                provider="copilot",
+                api_key="copilot-token",
+                base_url="https://api.githubcopilot.com",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert agent.api_mode == "anthropic_messages"
+        assert agent.context_compressor.context_length == 1_000_000
+        mock_anthropic.Anthropic.assert_called_once()
+        mock_anthropic_ctx.assert_called()
+        # If api_mode propagation breaks again, startup would fall back to 200k.
+        mock_copilot_ctx.assert_not_called()
+
     def test_prompt_caching_claude_openrouter(self):
         """Claude model via OpenRouter should enable prompt caching."""
         with (

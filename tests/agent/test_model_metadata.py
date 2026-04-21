@@ -711,3 +711,48 @@ class TestContextLengthCache:
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
             save_context_length(model, url, 200000)
             assert get_cached_context_length(model, url) == 200000
+
+
+class TestAnthropicContextForModel:
+    """Tests for _anthropic_context_for_model() — Anthropic context lookup by model."""
+
+    def test_sonnet_46_returns_1m(self):
+        from agent.model_metadata import _anthropic_context_for_model
+        assert _anthropic_context_for_model("claude-sonnet-4.6") == 1_000_000
+
+    def test_opus_46_regular_returns_none(self):
+        """Regular opus-4.6 uses Copilot catalog (144k), not Anthropic lookup."""
+        from agent.model_metadata import _anthropic_context_for_model
+        assert _anthropic_context_for_model("claude-opus-4.6") is None
+
+    def test_haiku_45_returns_200k(self):
+        from agent.model_metadata import _anthropic_context_for_model
+        assert _anthropic_context_for_model("claude-haiku-4.5") == 200_000
+
+    def test_opus_46_1m_variant(self):
+        """opus-4.6-1m uses Copilot catalog (1M), not Anthropic lookup."""
+        from agent.model_metadata import _anthropic_context_for_model
+        # -1m variant is NOT in Anthropic dict (it's a Copilot-specific model)
+        assert _anthropic_context_for_model("claude-opus-4.6-1m") is None
+
+    def test_older_models_200k(self):
+        from agent.model_metadata import _anthropic_context_for_model
+        assert _anthropic_context_for_model("claude-sonnet-4.5") == 200_000
+        assert _anthropic_context_for_model("claude-opus-4.5") == 200_000
+
+    def test_dash_format(self):
+        """Dash-format sonnet returns 1M; opus dash falls through (Copilot catalog)."""
+        from agent.model_metadata import _anthropic_context_for_model
+        assert _anthropic_context_for_model("claude-sonnet-4-6") == 1_000_000
+        assert _anthropic_context_for_model("claude-opus-4-6") is None
+
+    def test_unknown_model_returns_none(self):
+        from agent.model_metadata import _anthropic_context_for_model
+        assert _anthropic_context_for_model("unknown-model") is None
+
+    def test_unknown_model_emits_warning(self, caplog):
+        import logging
+        from agent.model_metadata import _anthropic_context_for_model
+        with caplog.at_level(logging.WARNING):
+            _anthropic_context_for_model("gpt-5.4")
+        assert "not in Anthropic context lookup" in caplog.text

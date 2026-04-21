@@ -1,0 +1,546 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index b85f77a9d23..918e44fd017 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -224,7 +224,11 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
+     if not normalized:
+         return False
+     normalized = normalized.rstrip("/").lower()
+-    return normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
++    return normalized.startswith((
++        "https://api.minimax.io/anthropic",
++        "https://api.minimaxi.com/anthropic",
++        "https://api.githubcopilot.com",
++    ))
+ 
+ 
+ def _common_betas_for_base_url(base_url: str | None) -> list[str]:
+@@ -262,7 +266,7 @@ def build_anthropic_client(api_key: str, base_url: str = None):
+ 
+     if _requires_bearer_auth(normalized_base_url):
+         # Some Anthropic-compatible providers (e.g. MiniMax) expect the API key in
+-        # Authorization: Bearer even for regular API keys. Route those endpoints
++        # Authorization: Bearer *** for regular API keys. Route those endpoints
+         # through auth_token so the SDK sends Bearer auth instead of x-api-key.
+         # Check this before OAuth token shape detection because MiniMax secrets do
+         # not use Anthropic's sk-ant-api prefix and would otherwise be misread as
+@@ -270,6 +274,13 @@ def build_anthropic_client(api_key: str, base_url: str = None):
+         kwargs["auth_token"] = api_key
+         if common_betas:
+             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
++        if "githubcopilot.com" in normalized_base_url:
++            from hermes_cli.models import copilot_default_headers
++
++            kwargs["default_headers"] = {
++                **kwargs.get("default_headers", {}),
++                **copilot_default_headers(),
++            }
+     elif _is_third_party_anthropic_endpoint(base_url):
+         # Third-party proxies (Azure AI Foundry, AWS Bedrock, etc.) use their
+         # own API keys with x-api-key auth. Skip OAuth detection — their keys
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index ac5db77625e..6fb83143677 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -257,6 +257,7 @@ def __init__(
+             model, base_url=base_url, api_key=api_key,
+             config_context_length=config_context_length,
+             provider=provider,
++            api_mode=api_mode,
+         )
+         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
+         # the percentage would suggest a lower value.  This prevents premature
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 46480da2352..c2e2a147086 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -867,6 +867,59 @@ def _normalize_model_version(model: str) -> str:
+     return model.replace(".", "-")
+ 
+ 
++def _anthropic_context_for_model(model: str) -> Optional[int]:
++    """Return Anthropic's context window for a Claude model.
++
++    Source: https://platform.claude.com/docs/en/about-claude/models/overview
++    Used when Copilot routes via /v1/messages (Anthropic format) — the real
++    limit is Anthropic's, not the Copilot catalog's conservative value.
++    """
++    _model = model.lower().replace("-", "-")
++    # Anthropic uses dashes (claude-opus-4-6), Copilot uses dots (claude-opus-4.6)
++    _families = {
++        "claude-sonnet-4-6": 1_000_000,
++        "claude-haiku-4-5": 200_000,
++        "claude-opus-4-5": 200_000,
++        "claude-sonnet-4-5": 200_000,
++    }
++    # Normalize dots to dashes for matching
++    _normalized = _model.replace(".", "-")
++    for family, ctx in _families.items():
++        if _normalized.startswith(family):
++            return ctx
++    logger.warning(
++        "Copilot Claude model %r not in Anthropic context lookup — "
++        "context window may be incorrect. Supported: %s",
++        model, ", ".join(_families.keys()),
++    )
++    return None
++
++
++def _query_copilot_context_length(model: str, api_key: str) -> Optional[int]:
++    """Query Copilot's /models endpoint for exact context length per model variant.
++
++    The Copilot catalog reports precise limits (e.g. opus-4.6=144k,
++    opus-4.6-1m=1M, sonnet-4.6=200k) in capabilities.limits.
++    """
++    try:
++        from hermes_cli.models import fetch_github_model_catalog
++        catalog = fetch_github_model_catalog(api_key=api_key or None)
++        if not catalog:
++            return None
++        for item in catalog:
++            if item.get("id") != model:
++                continue
++            capabilities = item.get("capabilities") or {}
++            limits = capabilities.get("limits") or {}
++            ctx = limits.get("max_context_window_tokens")
++            if isinstance(ctx, int) and ctx > 0:
++                return ctx
++            break
++    except Exception as e:
++        logger.debug("Copilot /models query failed: %s", e)
++    return None
++
++
+ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> Optional[int]:
+     """Query Anthropic's /v1/models endpoint for context length.
+ 
+@@ -937,25 +990,36 @@ def get_model_context_length(
+     api_key: str = "",
+     config_context_length: int | None = None,
+     provider: str = "",
++    api_mode: str = "",
+ ) -> int:
+     """Get the context length for a model.
+ 
+     Resolution order:
+     0. Explicit config override (model.context_length or custom_providers per-model)
++    0b. Anthropic context limits (when api_mode=anthropic_messages via Copilot)
+     1. Persistent cache (previously discovered via probing)
+     2. Active endpoint metadata (/models for explicit custom endpoints)
+     3. Local server query (for local endpoints)
+-    4. Anthropic /v1/models API (API-key users only, not OAuth)
+-    5. OpenRouter live API metadata
+-    6. Nous suffix-match via OpenRouter cache
+-    7. models.dev registry lookup (provider-aware)
+-    8. Thin hardcoded defaults (broad family patterns)
+-    9. Default fallback (128K)
++    4. Copilot /models API (exact per-variant limits)
++    5. Anthropic /v1/models API (API-key users only, not OAuth)
++    6. Provider-aware lookups (models.dev)
++    7. OpenRouter live API metadata
++    8. Nous suffix-match via OpenRouter cache
++    9. Thin hardcoded defaults (broad family patterns)
++    10. Default fallback (128K)
+     """
+     # 0. Explicit config override — user knows best
+     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
+         return config_context_length
+ 
++    # 0b. When Copilot routes Claude via Anthropic Messages API (/v1/messages),
++    # the actual context limit is Anthropic's, not Copilot's conservative value.
++    # Source: Anthropic official docs (platform.claude.com/docs/en/about-claude/models/overview).
++    if api_mode == "anthropic_messages" and provider in ("copilot", "github-copilot"):
++        ctx = _anthropic_context_for_model(model)
++        if ctx:
++            return ctx
++
+     # Normalise provider-prefixed model names (e.g. "local:model-name" →
+     # "model-name") so cache lookups and server queries use the bare ID that
+     # local servers actually know about.  Ollama "model:tag" colons are preserved.
+@@ -1004,7 +1068,17 @@ def get_model_context_length(
+             )
+             return DEFAULT_FALLBACK_CONTEXT
+ 
+-    # 4. Anthropic /v1/models API (only for regular API keys, not OAuth)
++    # 4. Copilot /models API — has exact context limits per model variant
++    # (e.g. opus-4.6=144k, opus-4.6-1m=1M, sonnet-4.6=200k).
++    _is_copilot = provider in ("copilot", "github-copilot") or (
++        base_url and "api.githubcopilot.com" in base_url
++    )
++    if _is_copilot:
++        ctx = _query_copilot_context_length(model, api_key)
++        if ctx:
++            return ctx
++
++    # 5. Anthropic /v1/models API (only for regular API keys, not OAuth)
+     if provider == "anthropic" or (
+         base_url and "api.anthropic.com" in base_url
+     ):
+@@ -1012,7 +1086,7 @@ def get_model_context_length(
+         if ctx:
+             return ctx
+ 
+-    # 5. Provider-aware lookups (before generic OpenRouter cache)
++    # 6. Provider-aware lookups (before generic OpenRouter cache)
+     # These are provider-specific and take priority over the generic OR cache,
+     # since the same model can have different context limits per provider
+     # (e.g. claude-opus-4.6 is 1M on Anthropic but 128K on GitHub Copilot).
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 18f29c6cd3b..5403d4b51f3 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -1547,6 +1547,9 @@ def copilot_model_api_mode(
+     if _should_use_copilot_responses_api(normalized):
+         return "codex_responses"
+ 
++    if normalized.startswith("claude-"):
++        return "anthropic_messages"
++
+     # Secondary: check catalog for non-GPT-5 models (Claude via /v1/messages, etc.)
+     if catalog is None and api_key:
+         catalog = fetch_github_model_catalog(api_key=api_key)
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index b2dec61cdbf..885848f6887 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -167,6 +167,13 @@ def _resolve_runtime_from_pool_entry(
+         api_mode = "chat_completions"
+     elif provider == "copilot":
+         api_mode = _copilot_runtime_api_mode(model_cfg, getattr(entry, "runtime_api_key", ""))
++        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
++        cfg_base_url = ""
++        if cfg_provider == "copilot":
++            cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
++        pconfig = PROVIDER_REGISTRY.get(provider)
++        default_base_url = pconfig.inference_base_url.rstrip("/") if pconfig and pconfig.inference_base_url else ""
++        base_url = cfg_base_url or base_url or default_base_url
+     else:
+         configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+         # Honour model.base_url from config.yaml when the configured provider
+diff --git a/run_agent.py b/run_agent.py
+index 48382389eaf..e0840f8ccda 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -691,6 +691,15 @@ def __init__(
+             # use a URL convention ending in /anthropic. Auto-detect these so the
+             # Anthropic Messages API adapter is used instead of chat completions.
+             self.api_mode = "anthropic_messages"
++        elif self.provider in ("copilot", "github-copilot"):
++            # Copilot Claude models use /v1/messages for full 1M context.
++            # GPT models stay on chat_completions (set by default below).
++            try:
++                from hermes_cli.models import copilot_model_api_mode
++                _resolved = copilot_model_api_mode(self.model)
++                self.api_mode = _resolved if _resolved in {"anthropic_messages", "codex_responses"} else "chat_completions"
++            except Exception:
++                self.api_mode = "chat_completions"
+         else:
+             self.api_mode = "chat_completions"
+ 
+@@ -1373,6 +1382,7 @@ def __init__(
+                 api_key=getattr(self, "api_key", ""),
+                 config_context_length=_config_context_length,
+                 provider=self.provider,
++                api_mode=getattr(self, "api_mode", ""),
+             )
+             self.context_compressor.update_model(
+                 model=self.model,
+@@ -1584,6 +1594,15 @@ def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mod
+         # ── Determine api_mode if not provided ──
+         if not api_mode:
+             api_mode = determine_api_mode(new_provider, base_url)
++            # Copilot Claude models should use Anthropic Messages API for full 1M context
++            if new_provider in ("copilot", "github-copilot") and api_mode == "chat_completions":
++                try:
++                    from hermes_cli.models import copilot_model_api_mode
++                    _resolved = copilot_model_api_mode(new_model)
++                    if _resolved in {"anthropic_messages", "codex_responses"}:
++                        api_mode = _resolved
++                except Exception:
++                    pass
+ 
+         old_model = self.model
+         old_provider = self.provider
+@@ -1646,6 +1665,7 @@ def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mod
+                 api_key=self.api_key,
+                 provider=self.provider,
+                 config_context_length=getattr(self, "_config_context_length", None),
++                api_mode=self.api_mode,
+             )
+             self.context_compressor.update_model(
+                 model=self.model,
+@@ -5663,6 +5683,15 @@ def _try_activate_fallback(self) -> bool:
+                 # GPT-5.x models need Responses API on every provider
+                 # (OpenRouter, Copilot, direct OpenAI, etc.)
+                 fb_api_mode = "codex_responses"
++            elif fb_provider in ("copilot", "github-copilot"):
++                # Copilot Claude models use /v1/messages for full 1M context
++                try:
++                    from hermes_cli.models import copilot_model_api_mode
++                    _resolved = copilot_model_api_mode(fb_model)
++                    if _resolved in {"anthropic_messages", "codex_responses"}:
++                        fb_api_mode = _resolved
++                except Exception:
++                    pass
+ 
+             old_model = self.model
+             self.model = fb_model
+@@ -5719,6 +5748,7 @@ def _try_activate_fallback(self) -> bool:
+                 fb_context_length = get_model_context_length(
+                     self.model, base_url=self.base_url,
+                     api_key=self.api_key, provider=self.provider,
++                    api_mode=self.api_mode,
+                 )
+                 self.context_compressor.update_model(
+                     model=self.model,
+diff --git a/scripts/release.py b/scripts/release.py
+index 04625562759..00295bd7077 100755
+--- a/scripts/release.py
++++ b/scripts/release.py
+@@ -101,6 +101,7 @@
+     "bryan@intertwinesys.com": "bryanyoung",
+     "christo.mitov@gmail.com": "christomitov",
+     "hermes@nousresearch.com": "NousResearch",
++    "MestreY0d4-Uninter@users.noreply.github.com": "MestreY0d4-Uninter",
+     "chinmingcock@gmail.com": "ChimingLiu",
+     "openclaw@sparklab.ai": "openclaw",
+     "semihcvlk53@gmail.com": "Himess",
+diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
+index ae78888d86f..9b0a8b8d0f2 100644
+--- a/tests/agent/test_anthropic_adapter.py
++++ b/tests/agent/test_anthropic_adapter.py
+@@ -11,6 +11,7 @@
+ from agent.anthropic_adapter import (
+     _is_oauth_token,
+     _refresh_oauth_token,
++    _requires_bearer_auth,
+     _to_plain_data,
+     _write_claude_code_credentials,
+     build_anthropic_client,
+@@ -55,6 +56,22 @@ def test_empty(self):
+         assert _is_oauth_token("") is False
+ 
+ 
++class TestRequiresBearerAuth:
++    def test_requires_bearer_auth_copilot(self):
++        assert _requires_bearer_auth("https://api.githubcopilot.com") is True
++        assert _requires_bearer_auth("https://api.githubcopilot.com/") is True
++        assert _requires_bearer_auth("https://api.githubcopilot.com/v1") is True
++        # MiniMax still works
++        assert _requires_bearer_auth("https://api.minimax.io/anthropic") is True
++        # Anthropic native should NOT be bearer-auth third-party
++        assert _requires_bearer_auth("https://api.anthropic.com") is False
++
++    def test_requires_bearer_auth_unrelated(self):
++        assert _requires_bearer_auth("https://api.openai.com/v1") is False
++        assert _requires_bearer_auth("") is False
++        assert _requires_bearer_auth(None) is False
++
++
+ class TestBuildAnthropicClient:
+     def test_setup_token_uses_auth_token(self):
+         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+diff --git a/tests/agent/test_context_compressor.py b/tests/agent/test_context_compressor.py
+index 6164d812f6b..f4f9b5686b3 100644
+--- a/tests/agent/test_context_compressor.py
++++ b/tests/agent/test_context_compressor.py
+@@ -223,6 +223,22 @@ def test_summary_call_passes_live_main_runtime(self):
+         }
+ 
+ 
++class TestContextLengthResolution:
++    def test_constructor_passes_api_mode_to_context_lookup(self):
++        with patch("agent.context_compressor.get_model_context_length", return_value=200_000) as mock_ctx:
++            ContextCompressor(
++                model="claude-sonnet-4.6",
++                provider="copilot",
++                base_url="https://api.githubcopilot.com",
++                api_key="copilot-token",
++                api_mode="anthropic_messages",
++                quiet_mode=True,
++            )
++
++        assert mock_ctx.call_args.kwargs["api_mode"] == "anthropic_messages"
++        assert mock_ctx.call_args.kwargs["provider"] == "copilot"
++
++
+ class TestSummaryFailureCooldown:
+     def test_summary_failure_enters_cooldown_and_skips_retry(self):
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+diff --git a/tests/agent/test_model_metadata.py b/tests/agent/test_model_metadata.py
+index df680fb241c..52d19fb08fe 100644
+--- a/tests/agent/test_model_metadata.py
++++ b/tests/agent/test_model_metadata.py
+@@ -709,3 +709,48 @@ def test_special_chars_in_model_name(self, tmp_path):
+         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+             save_context_length(model, url, 200000)
+             assert get_cached_context_length(model, url) == 200000
++
++
++class TestAnthropicContextForModel:
++    """Tests for _anthropic_context_for_model() — Anthropic context lookup by model."""
++
++    def test_sonnet_46_returns_1m(self):
++        from agent.model_metadata import _anthropic_context_for_model
++        assert _anthropic_context_for_model("claude-sonnet-4.6") == 1_000_000
++
++    def test_opus_46_regular_returns_none(self):
++        """Regular opus-4.6 uses Copilot catalog (144k), not Anthropic lookup."""
++        from agent.model_metadata import _anthropic_context_for_model
++        assert _anthropic_context_for_model("claude-opus-4.6") is None
++
++    def test_haiku_45_returns_200k(self):
++        from agent.model_metadata import _anthropic_context_for_model
++        assert _anthropic_context_for_model("claude-haiku-4.5") == 200_000
++
++    def test_opus_46_1m_variant(self):
++        """opus-4.6-1m uses Copilot catalog (1M), not Anthropic lookup."""
++        from agent.model_metadata import _anthropic_context_for_model
++        # -1m variant is NOT in Anthropic dict (it's a Copilot-specific model)
++        assert _anthropic_context_for_model("claude-opus-4.6-1m") is None
++
++    def test_older_models_200k(self):
++        from agent.model_metadata import _anthropic_context_for_model
++        assert _anthropic_context_for_model("claude-sonnet-4.5") == 200_000
++        assert _anthropic_context_for_model("claude-opus-4.5") == 200_000
++
++    def test_dash_format(self):
++        """Dash-format sonnet returns 1M; opus dash falls through (Copilot catalog)."""
++        from agent.model_metadata import _anthropic_context_for_model
++        assert _anthropic_context_for_model("claude-sonnet-4-6") == 1_000_000
++        assert _anthropic_context_for_model("claude-opus-4-6") is None
++
++    def test_unknown_model_returns_none(self):
++        from agent.model_metadata import _anthropic_context_for_model
++        assert _anthropic_context_for_model("unknown-model") is None
++
++    def test_unknown_model_emits_warning(self, caplog):
++        import logging
++        from agent.model_metadata import _anthropic_context_for_model
++        with caplog.at_level(logging.WARNING):
++            _anthropic_context_for_model("gpt-5.4")
++        assert "not in Anthropic context lookup" in caplog.text
+diff --git a/tests/hermes_cli/test_model_validation.py b/tests/hermes_cli/test_model_validation.py
+index 5ed6b9d5434..ede7a917294 100644
+--- a/tests/hermes_cli/test_model_validation.py
++++ b/tests/hermes_cli/test_model_validation.py
+@@ -330,14 +330,28 @@ def test_copilot_api_mode_gpt5_mini_uses_chat(self):
+         assert copilot_model_api_mode("gpt-5-mini") == "chat_completions"
+ 
+     def test_copilot_api_mode_non_gpt5_uses_chat(self):
+-        """Non-GPT-5 models use Chat Completions."""
++        """Non-GPT-5, non-Claude models use Chat Completions. Claude uses Anthropic Messages."""
+         assert copilot_model_api_mode("gpt-4.1") == "chat_completions"
+         assert copilot_model_api_mode("gpt-4o") == "chat_completions"
+         assert copilot_model_api_mode("gpt-4o-mini") == "chat_completions"
+-        assert copilot_model_api_mode("claude-sonnet-4.6") == "chat_completions"
+-        assert copilot_model_api_mode("claude-opus-4.6") == "chat_completions"
+         assert copilot_model_api_mode("gemini-2.5-pro") == "chat_completions"
+ 
++    def test_copilot_api_mode_claude_uses_anthropic_messages(self):
++        """Claude models on Copilot use Anthropic Messages API for full 1M context."""
++        assert copilot_model_api_mode("claude-sonnet-4.6") == "anthropic_messages"
++        assert copilot_model_api_mode("claude-opus-4.6") == "anthropic_messages"
++        assert copilot_model_api_mode("claude-haiku-4.5") == "anthropic_messages"
++
++    def test_copilot_api_mode_claude_1m_variant(self):
++        """claude-opus-4.6-1m variant should also use anthropic_messages."""
++        assert copilot_model_api_mode("claude-opus-4.6-1m") == "anthropic_messages"
++
++    def test_copilot_api_mode_older_claude(self):
++        """Older Claude models on Copilot should also use anthropic_messages."""
++        assert copilot_model_api_mode("claude-sonnet-4") == "anthropic_messages"
++        assert copilot_model_api_mode("claude-sonnet-4.5") == "anthropic_messages"
++        assert copilot_model_api_mode("claude-opus-4.5") == "anthropic_messages"
++
+     def test_copilot_api_mode_with_catalog_both_endpoints(self):
+         """When catalog shows both endpoints, model ID pattern wins."""
+         catalog = [{
+diff --git a/tests/hermes_cli/test_runtime_provider_resolution.py b/tests/hermes_cli/test_runtime_provider_resolution.py
+index c7510a55b8f..6f346375d2b 100644
+--- a/tests/hermes_cli/test_runtime_provider_resolution.py
++++ b/tests/hermes_cli/test_runtime_provider_resolution.py
+@@ -57,6 +57,40 @@ def select(self):
+     assert resolved["base_url"] == "https://proxy.example.com/anthropic"
+ 
+ 
++def test_resolve_runtime_provider_copilot_pool_respects_config_base_url(monkeypatch):
++    class _Entry:
++        access_token = "pool-token"
++        source = "gh_cli"
++        base_url = ""
++
++    class _Pool:
++        def has_credentials(self):
++            return True
++
++        def select(self):
++            return _Entry()
++
++    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "copilot")
++    monkeypatch.setattr(
++        rp,
++        "_get_model_config",
++        lambda: {
++            "provider": "copilot",
++            "base_url": "https://api.githubcopilot.com",
++            "default": "claude-sonnet-4.6",
++            "api_mode": "anthropic_messages",
++        },
++    )
++    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
++
++    resolved = rp.resolve_runtime_provider(requested="copilot")
++
++    assert resolved["provider"] == "copilot"
++    assert resolved["api_mode"] == "anthropic_messages"
++    assert resolved["api_key"] == "pool-token"
++    assert resolved["base_url"] == "https://api.githubcopilot.com"
++
++
+ def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):
+     def _unexpected_pool(provider):
+         raise AssertionError(f"load_pool should not be called for {provider}")
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index d71e6a62554..91f6a249a78 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -465,6 +465,38 @@ def test_anthropic_base_url_accepted(self):
+             assert agent.api_mode == "anthropic_messages"
+             mock_anthropic.Anthropic.assert_called_once()
+ 
++    def test_copilot_sonnet_anthropic_messages_initializes_compressor_with_1m_context(self):
++        """Copilot Sonnet 4.6 should initialize compressor with Anthropic 1M limit.
++
++        Regression test for the startup bug where AIAgent correctly routed
++        Copilot Claude to ``anthropic_messages`` but ContextCompressor still
++        initialized from the Copilot catalog value (200k) because api_mode was
++        not forwarded into get_model_context_length().
++        """
++        with (
++            patch("run_agent.get_tool_definitions", return_value=[]),
++            patch("run_agent.check_toolset_requirements", return_value={}),
++            patch("agent.anthropic_adapter._anthropic_sdk") as mock_anthropic,
++            patch("agent.model_metadata._anthropic_context_for_model", return_value=1_000_000) as mock_anthropic_ctx,
++            patch("agent.model_metadata._query_copilot_context_length", return_value=200_000) as mock_copilot_ctx,
++        ):
++            agent = AIAgent(
++                model="claude-sonnet-4.6",
++                provider="copilot",
++                api_key="copilot-token",
++                base_url="https://api.githubcopilot.com",
++                quiet_mode=True,
++                skip_context_files=True,
++                skip_memory=True,
++            )
++
++        assert agent.api_mode == "anthropic_messages"
++        assert agent.context_compressor.context_length == 1_000_000
++        mock_anthropic.Anthropic.assert_called_once()
++        mock_anthropic_ctx.assert_called()
++        # If api_mode propagation breaks again, startup would fall back to 200k.
++        mock_copilot_ctx.assert_not_called()
++
+     def test_prompt_caching_claude_openrouter(self):
+         """Claude model via OpenRouter should enable prompt caching."""
+         with (
