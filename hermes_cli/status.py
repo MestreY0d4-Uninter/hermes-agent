@@ -79,6 +79,38 @@ def _effective_provider_label() -> str:
     return provider_label(effective)
 
 
+def _env_file_status() -> tuple[bool, str]:
+    """Return whether an env file exists and the status label to display."""
+    env_path = get_env_path()
+    if env_path.exists():
+        return True, "exists"
+
+    project_env = PROJECT_ROOT / ".env"
+    if project_env.exists():
+        return True, "exists (project directory fallback)"
+
+    return False, "not found"
+
+
+def _state_db_session_count(hermes_home: Path) -> tuple[int | None, str | None]:
+    """Read the stored session count from state.db without creating a DB."""
+    state_db_path = hermes_home / "state.db"
+    if not state_db_path.exists():
+        return None, None
+
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(state_db_path))
+        try:
+            cursor = conn.execute("SELECT COUNT(*) FROM sessions")
+            return int(cursor.fetchone()[0]), None
+        finally:
+            conn.close()
+    except Exception as exc:
+        return None, str(exc)
+
+
 from hermes_constants import is_termux as _is_termux
 
 
@@ -100,8 +132,8 @@ def show_status(args):
     print(f"  Project:      {PROJECT_ROOT}")
     print(f"  Python:       {sys.version.split()[0]}")
     
-    env_path = get_env_path()
-    print(f"  .env file:    {check_mark(env_path.exists())} {'exists' if env_path.exists() else 'not found'}")
+    env_exists, env_label = _env_file_status()
+    print(f"  .env file:    {check_mark(env_exists)} {env_label}")
 
     try:
         config = load_config()
@@ -401,17 +433,24 @@ def show_status(args):
     print()
     print(color("◆ Sessions", Colors.CYAN, Colors.BOLD))
     
-    sessions_file = get_hermes_home() / "sessions" / "sessions.json"
-    if sessions_file.exists():
-        import json
-        try:
-            with open(sessions_file, encoding="utf-8") as f:
-                data = json.load(f)
-                print(f"  Active:       {len(data)} session(s)")
-        except Exception:
-            print("  Active:       (error reading sessions file)")
+    hermes_home = get_hermes_home()
+    stored_sessions, state_db_error = _state_db_session_count(hermes_home)
+    if stored_sessions is not None:
+        print(f"  Stored:       {stored_sessions} session(s) (state.db)")
+    elif state_db_error:
+        print(f"  Stored:       (error reading state.db: {state_db_error})")
     else:
-        print("  Active:       0")
+        sessions_file = hermes_home / "sessions" / "sessions.json"
+        if sessions_file.exists():
+            import json
+            try:
+                with open(sessions_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                    print(f"  Active:       {len(data)} session(s) (legacy sessions.json)")
+            except Exception:
+                print("  Active:       (error reading sessions file)")
+        else:
+            print("  Stored:       0")
     
     # =========================================================================
     # Deep checks
