@@ -631,6 +631,7 @@ class TestInit:
             patch("agent.anthropic_adapter._anthropic_sdk") as mock_anthropic,
             patch("agent.model_metadata._anthropic_context_for_model", return_value=1_000_000) as mock_anthropic_ctx,
             patch("agent.model_metadata._query_copilot_context_length", return_value=200_000) as mock_copilot_ctx,
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("copilot", "claude-sonnet-4.6", "", "", "anthropic_messages")),
         ):
             agent = AIAgent(
                 model="claude-sonnet-4.6",

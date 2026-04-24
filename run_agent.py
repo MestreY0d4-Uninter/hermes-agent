@@ -2385,7 +2385,10 @@ class AIAgent:
         if not self.compression_enabled:
             return
         try:
-            from agent.auxiliary_client import get_text_auxiliary_client
+            from agent.auxiliary_client import (
+                _resolve_task_provider_model,
+                get_text_auxiliary_client,
+            )
             from agent.model_metadata import (
                 MINIMUM_CONTEXT_LENGTH,
                 get_model_context_length,
@@ -2395,6 +2398,13 @@ class AIAgent:
                 "compression",
                 main_runtime=self._current_main_runtime(),
             )
+            (
+                aux_provider,
+                _,
+                _,
+                _,
+                aux_api_mode,
+            ) = _resolve_task_provider_model("compression")
             if client is None or not aux_model:
                 msg = (
                     "⚠ No auxiliary LLM provider configured — context "
@@ -2417,7 +2427,8 @@ class AIAgent:
                 base_url=aux_base_url,
                 api_key=aux_api_key,
                 config_context_length=getattr(self, "_aux_compression_context_length_config", None),
-                provider=getattr(self, "provider", ""),
+                provider=aux_provider,
+                api_mode=aux_api_mode,
             )
 
             # Hard floor: the auxiliary compression model must have at least

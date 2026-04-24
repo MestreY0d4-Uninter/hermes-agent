@@ -181,7 +181,8 @@ def test_feasibility_check_passes_config_context_length(mock_get_client, mock_ct
         base_url="http://custom-endpoint:8080/v1",
         api_key="sk-custom",
         config_context_length=1_000_000,
-        provider="openrouter",
+        provider="auto",
+        api_mode=None,
     )
 
 
@@ -204,7 +205,8 @@ def test_feasibility_check_ignores_invalid_context_length(mock_get_client, mock_
         base_url="http://custom:8080/v1",
         api_key="sk-test",
         config_context_length=None,
-        provider="openrouter",
+        provider="auto",
+        api_mode=None,
     )
 
 
@@ -257,7 +259,8 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
         base_url="http://custom-endpoint:8080/v1",
         api_key="sk-custom",
         config_context_length=1_000_000,
-        provider="",
+        provider="auto",
+        api_mode=None,
     )
 
 
@@ -442,3 +445,30 @@ def test_run_conversation_clears_warning_after_replay(mock_get_client, mock_ctx_
         agent._compression_warning = None
 
     assert len(callback_events) == 0
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=1_000_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+@patch("agent.auxiliary_client._resolve_task_provider_model")
+def test_aux_copilot_claude_uses_anthropic_context_length(
+    mock_resolve, mock_get_client, mock_ctx_len
+):
+    """When the auxiliary model is Copilot Claude, _check_compression_model_feasibility
+    must pass provider='copilot' and api_mode='anthropic_messages' to
+    get_model_context_length so the 1M Anthropic limit is used instead of
+    the 200K Copilot catalog default."""
+    agent = _make_agent(main_context=200_000, threshold_percent=0.50)
+    mock_client = MagicMock()
+    mock_client.base_url = "https://api.githubcopilot.com"
+    mock_client.api_key = "ghu-xxx"
+    mock_get_client.return_value = (mock_client, "claude-sonnet-4.6")
+    mock_resolve.return_value = ("copilot", "claude-sonnet-4.6", "", "", "anthropic_messages")
+
+    agent._emit_status = lambda msg: None
+    agent._check_compression_model_feasibility()
+
+    mock_ctx_len.assert_called_once()
+    _, kwargs = mock_ctx_len.call_args
+    assert kwargs["provider"] == "copilot"
+    assert kwargs["api_mode"] == "anthropic_messages"
+    assert kwargs["base_url"] == "https://api.githubcopilot.com"
