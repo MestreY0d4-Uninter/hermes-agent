@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -532,6 +533,117 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
 
     assert resp["result"]["status"] == "streaming"
     assert captured["session_key"] == "session-key"
+
+
+def _drain_process_completion_queue(process_registry):
+    while True:
+        try:
+            process_registry.completion_queue.get_nowait()
+        except queue.Empty:
+            break
+
+
+def test_tui_process_completion_notification_starts_agent_turn(monkeypatch):
+    from tools.process_registry import process_registry
+
+    _drain_process_completion_queue(process_registry)
+    server._sessions.clear()
+    prompts: list[str] = []
+    events: list[tuple[str, str, dict | None]] = []
+
+    class _Agent:
+        model = "test/model"
+        base_url = ""
+        api_key = ""
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            prompts.append(prompt)
+            return {
+                "final_response": "ack",
+                "messages": [{"role": "assistant", "content": "ack"}],
+            }
+
+    class _DummySlashWorker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server, "_make_agent", lambda *args, **kwargs: _Agent())
+    monkeypatch.setattr(server, "_SlashWorker", _DummySlashWorker)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_probe_credentials", lambda agent: "")
+    monkeypatch.setattr(server, "_probe_config_health", lambda cfg: "")
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: events.append((event, sid, payload)),
+    )
+
+    import tools.approval as _approval
+
+    monkeypatch.setattr(_approval, "register_gateway_notify", lambda key, cb: None)
+    monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
+
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.create", "params": {"cols": 80}}
+        )
+        sid = resp["result"]["session_id"]
+        assert server._sessions[sid]["agent_ready"].wait(timeout=1)
+        session_key = server._sessions[sid]["session_key"]
+
+        original_get = process_registry.get
+
+        def _fake_get(session_id):
+            if session_id == "proc_notify":
+                return types.SimpleNamespace(session_key=session_key)
+            return original_get(session_id)
+
+        monkeypatch.setattr(process_registry, "get", _fake_get)
+        process_registry.completion_queue.put(
+            {
+                "type": "completion",
+                "session_id": "proc_notify",
+                "command": "python -c 'print(42)'",
+                "exit_code": 0,
+                "output": "42\n",
+            }
+        )
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            got_prompt = any(
+                prompt.startswith("[SYSTEM: Background process proc_notify completed")
+                for prompt in prompts
+            )
+            got_complete = any(
+                event == "message.complete" and event_sid == sid
+                for event, event_sid, _ in events
+            )
+            if got_prompt and got_complete:
+                break
+            time.sleep(0.01)
+
+        assert prompts == [
+            "[SYSTEM: Background process proc_notify completed (exit code 0).\n"
+            "Command: python -c 'print(42)'\n"
+            "Output:\n42\n]"
+        ]
+        assert any(
+            event == "message.complete" and event_sid == sid
+            for event, event_sid, _ in events
+        )
+    finally:
+        server._sessions.clear()
+        _drain_process_completion_queue(process_registry)
 
 
 def test_prompt_submit_expands_context_refs(monkeypatch):

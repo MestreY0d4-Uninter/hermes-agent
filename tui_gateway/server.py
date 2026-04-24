@@ -154,6 +154,9 @@ _pool = concurrent.futures.ThreadPoolExecutor(
 )
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
 
+_process_notification_thread: threading.Thread | None = None
+_process_notification_lock = threading.Lock()
+
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
 # of corrupting the JSON protocol.
@@ -508,7 +511,146 @@ def _enable_gateway_prompts() -> None:
     os.environ["HERMES_INTERACTIVE"] = "1"
 
 
-# ── Blocking prompt factory ──────────────────────────────────────────
+def _format_process_notification(evt: dict) -> str | None:
+    """Format a queued background-process event as a synthetic agent prompt."""
+    evt_type = evt.get("type", "completion")
+    process_sid = evt.get("session_id", "unknown")
+    command = evt.get("command", "unknown")
+
+    if evt_type == "watch_disabled":
+        return f"[SYSTEM: {evt.get('message', '')}]"
+
+    if evt_type == "watch_match":
+        pattern = evt.get("pattern", "?")
+        output = evt.get("output", "")
+        suppressed = evt.get("suppressed", 0)
+        text = (
+            f"[SYSTEM: Background process {process_sid} matched "
+            f'watch pattern "{pattern}".\n'
+            f"Command: {command}\n"
+            f"Matched output:\n{output}"
+        )
+        if suppressed:
+            text += f"\n({suppressed} earlier matches were suppressed by rate limit)"
+        return text + "]"
+
+    exit_code = evt.get("exit_code", "?")
+    output = evt.get("output", "")
+    return (
+        f"[SYSTEM: Background process {process_sid} completed "
+        f"(exit code {exit_code}).\n"
+        f"Command: {command}\n"
+        f"Output:\n{output}]"
+    )
+
+
+def _session_for_process_event(evt: dict, process_registry) -> tuple[str, dict] | None:
+    session_key = str(evt.get("session_key") or "")
+    process_sid = str(evt.get("session_id") or "")
+    if not session_key and process_sid:
+        process = process_registry.get(process_sid)
+        session_key = str(getattr(process, "session_key", "") or "")
+    if not session_key:
+        return None
+
+    for sid, session in list(_sessions.items()):
+        if session.get("session_key") == session_key:
+            return sid, session
+    return None
+
+
+def _wait_for_notification_slot(sid: str, session: dict) -> bool:
+    ready = session.get("agent_ready")
+    if ready is not None and not ready.wait(timeout=30.0):
+        logger.warning("Dropping process notification: session %s not ready", sid)
+        return False
+
+    while _sessions.get(sid) is session and session.get("running"):
+        time.sleep(0.1)
+    return _sessions.get(sid) is session
+
+
+def _dispatch_process_notification(evt: dict, process_registry) -> None:
+    if not isinstance(evt, dict):
+        return
+
+    process_sid = str(evt.get("session_id") or "")
+    if evt.get("type", "completion") == "completion" and process_sid:
+        if process_registry.is_completion_consumed(process_sid):
+            return
+
+    match = _session_for_process_event(evt, process_registry)
+    if match is None:
+        logger.debug(
+            "Dropping process notification with no matching TUI session: %s",
+            evt.get("session_id", "unknown"),
+        )
+        return
+
+    sid, session = match
+    if not _wait_for_notification_slot(sid, session):
+        return
+    if evt.get("type", "completion") == "completion" and process_sid:
+        if process_registry.is_completion_consumed(process_sid):
+            return
+
+    text = _format_process_notification(evt)
+    if not text:
+        return
+    resp = handle_request(
+        {
+            "id": None,
+            "method": "prompt.submit",
+            "params": {"session_id": sid, "text": text},
+        }
+    )
+    if resp and resp.get("error"):
+        logger.warning(
+            "Process notification dispatch failed for %s: %s",
+            evt.get("session_id", "unknown"),
+            resp.get("error", {}).get("message", resp["error"]),
+        )
+
+
+def _process_notification_loop() -> None:
+    while True:
+        if not _sessions:
+            time.sleep(0.1)
+            continue
+        try:
+            from tools.process_registry import process_registry
+
+            evt = process_registry.completion_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        except Exception as exc:
+            logger.debug("Process notification worker idle error: %s", exc)
+            time.sleep(0.5)
+            continue
+
+        try:
+            _dispatch_process_notification(evt, process_registry)
+        except Exception as exc:
+            logger.warning("Process notification dispatch error: %s", exc)
+
+
+def _ensure_process_notification_worker() -> None:
+    global _process_notification_thread
+    with _process_notification_lock:
+        if (
+            _process_notification_thread is not None
+            and _process_notification_thread.is_alive()
+        ):
+            return
+        _process_notification_thread = threading.Thread(
+            target=_process_notification_loop,
+            name="tui-process-notify",
+            daemon=True,
+        )
+        _process_notification_thread.start()
+
+
+# ── Shell helpers ─────────────────────────────────────────────────────
 
 
 def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
@@ -1360,6 +1502,7 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
         load_permanent_allowlist()
     except Exception:
         pass
+    _ensure_process_notification_worker()
     _wire_callbacks(sid)
     _emit("session.info", sid, _session_info(agent))
 
@@ -1489,6 +1632,7 @@ def _(rid, params: dict) -> dict:
         "tool_started_at": {},
         "transport": current_transport() or _stdio_transport,
     }
+    _ensure_process_notification_worker()
 
     def _build() -> None:
         session = _sessions.get(sid)
