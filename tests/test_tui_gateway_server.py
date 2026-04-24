@@ -646,6 +646,94 @@ def test_tui_process_completion_notification_starts_agent_turn(monkeypatch):
         _drain_process_completion_queue(process_registry)
 
 
+def test_tui_process_notification_rechecks_consumed_after_wait(monkeypatch):
+    """If wait/poll/log consumes a completion while the TUI session is busy,
+    the post-wait consumed check must suppress the synthetic prompt.
+    """
+
+    class _FakeProcessRegistry:
+        consumed = False
+
+        def get(self, session_id):
+            return types.SimpleNamespace(session_key="session-key")
+
+        def is_completion_consumed(self, session_id):
+            assert session_id == "proc_notify"
+            return self.consumed
+
+    fake_registry = _FakeProcessRegistry()
+    dispatched: list[dict] = []
+
+    def _consume_during_wait(sid, session):
+        fake_registry.consumed = True
+        return True
+
+    monkeypatch.setattr(server, "_wait_for_notification_slot", _consume_during_wait)
+    monkeypatch.setattr(
+        server,
+        "handle_request",
+        lambda request: dispatched.append(request) or {"result": {}},
+    )
+
+    server._sessions.clear()
+    server._sessions["sid"] = {"session_key": "session-key", "running": False}
+    try:
+        server._dispatch_process_notification(
+            {
+                "type": "completion",
+                "session_id": "proc_notify",
+                "command": "python -c 'print(42)'",
+                "exit_code": 0,
+                "output": "42\n",
+            },
+            fake_registry,
+        )
+
+        assert dispatched == []
+    finally:
+        server._sessions.clear()
+
+
+def test_tui_process_notification_uses_synthetic_request_id(monkeypatch):
+    class _FakeProcessRegistry:
+        def get(self, session_id):
+            return types.SimpleNamespace(session_key="session-key")
+
+        def is_completion_consumed(self, session_id):
+            return False
+
+    dispatched: list[dict] = []
+
+    monkeypatch.setattr(
+        server, "_wait_for_notification_slot", lambda sid, session: True
+    )
+    monkeypatch.setattr(
+        server,
+        "handle_request",
+        lambda request: dispatched.append(request) or {"result": {}},
+    )
+
+    server._sessions.clear()
+    server._sessions["sid"] = {"session_key": "session-key", "running": False}
+    try:
+        server._dispatch_process_notification(
+            {
+                "type": "completion",
+                "session_id": "proc_notify",
+                "command": "python -c 'print(42)'",
+                "exit_code": 0,
+                "output": "42\n",
+            },
+            _FakeProcessRegistry(),
+        )
+
+        assert len(dispatched) == 1
+        assert dispatched[0]["id"].startswith("process-notify-")
+        assert dispatched[0]["method"] == "prompt.submit"
+    finally:
+        server._sessions.clear()
+
+
 def test_prompt_submit_expands_context_refs(monkeypatch):
     captured = {}
 

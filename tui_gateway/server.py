@@ -599,7 +599,7 @@ def _dispatch_process_notification(evt: dict, process_registry) -> None:
         return
     resp = handle_request(
         {
-            "id": None,
+            "id": f"process-notify-{uuid.uuid4().hex[:8]}",
             "method": "prompt.submit",
             "params": {"session_id": sid, "text": text},
         }
