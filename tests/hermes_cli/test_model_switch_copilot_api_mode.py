@@ -56,7 +56,7 @@ def _run_copilot_switch(
 
 
 def test_same_provider_copilot_switch_recomputes_api_mode():
-    """GPT-5 → Claude on copilot: api_mode must flip to chat_completions."""
+    """GPT-5 → Claude on copilot: api_mode must flip to anthropic_messages."""
     result = _run_copilot_switch(
         raw_input="claude-opus-4.6",
         current_provider="copilot",
@@ -66,7 +66,7 @@ def test_same_provider_copilot_switch_recomputes_api_mode():
     assert result.success, f"switch_model failed: {result.error_message}"
     assert result.new_model == "claude-opus-4.6"
     assert result.target_provider == "copilot"
-    assert result.api_mode == "chat_completions"
+    assert result.api_mode == "anthropic_messages"
 
 
 def test_explicit_copilot_switch_uses_selected_model_api_mode():
@@ -81,7 +81,7 @@ def test_explicit_copilot_switch_uses_selected_model_api_mode():
     assert result.success, f"switch_model failed: {result.error_message}"
     assert result.new_model == "claude-opus-4.6"
     assert result.target_provider == "github-copilot"
-    assert result.api_mode == "chat_completions"
+    assert result.api_mode == "anthropic_messages"
 
 
 def test_copilot_gpt5_keeps_codex_responses():
