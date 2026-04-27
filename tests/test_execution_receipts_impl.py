@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import tempfile
 import time
 from pathlib import Path
@@ -50,6 +51,7 @@ class TestExecutionReceipt:
         receipt = ExecutionReceipt(task_id="test_task")
         path = receipt.save()
         assert path.exists()
+        assert path.parent == isolated_hermes_home / "artifacts" / "execution-receipts"
         data = json.loads(path.read_text())
         assert data["task_id"] == "test_task"
 
@@ -64,6 +66,32 @@ class TestReceiptLedger:
         loaded = get_receipt(receipt.receipt_id)
         assert loaded is not None
         assert loaded.task_id == "task_1"
+
+    def test_create_rolls_back_json_when_index_fails(self, isolated_hermes_home, monkeypatch):
+        from tools import execution_receipts
+
+        def fail_index(receipt):
+            raise sqlite3.OperationalError("index unavailable")
+
+        monkeypatch.setattr(execution_receipts, "index_receipt", fail_index)
+        with pytest.raises(sqlite3.OperationalError):
+            execution_receipts.create_receipt(task_id="rollback")
+        assert list(execution_receipts._get_receipts_dir().glob("*.json")) == []
+
+    def test_finalize_restores_previous_json_when_index_fails(self, isolated_hermes_home, monkeypatch):
+        from tools import execution_receipts
+
+        receipt = execution_receipts.create_receipt(task_id="rollback_update")
+        path = execution_receipts._get_receipts_dir() / f"{receipt.receipt_id}.json"
+        original = path.read_text()
+
+        def fail_index(updated_receipt):
+            raise sqlite3.OperationalError("index unavailable")
+
+        monkeypatch.setattr(execution_receipts, "index_receipt", fail_index)
+        with pytest.raises(sqlite3.OperationalError):
+            execution_receipts.finalize_receipt(receipt, status="failed", summary="should roll back")
+        assert path.read_text() == original
 
     def test_list_receipts(self, isolated_hermes_home):
         from tools.execution_receipts import create_receipt, list_receipts
@@ -104,21 +132,35 @@ class TestReceiptLedger:
         assert len(results) == 0
 
     def test_prune_receipts(self, isolated_hermes_home):
-        from tools.execution_receipts import create_receipt, list_receipts, prune_receipts
+        from tools.execution_receipts import create_receipt, index_receipt, list_receipts, prune_receipts
         for i in range(15):
-            create_receipt(task_id=f"task_{i}")
+            receipt = create_receipt(task_id=f"task_{i}")
+            receipt.timestamp = time.time() - 7200
+            index_receipt(receipt)
 
         assert len(list_receipts(limit=20)) == 15
-        result = prune_receipts(older_than_hours=0, keep_min=5)
+        result = prune_receipts(older_than_hours=1, keep_min=5)
         assert result["pruned"] == 10
         assert result["remaining"] == 5
         assert len(list_receipts(limit=20)) == 5
 
+    def test_prune_keeps_failed_receipts_by_default(self, isolated_hermes_home):
+        from tools.execution_receipts import create_receipt, finalize_receipt, index_receipt, prune_receipts
+        receipt = create_receipt(task_id="failed_task")
+        finalize_receipt(receipt, status="failed")
+        receipt.timestamp = time.time() - 7200
+        index_receipt(receipt)
+
+        result = prune_receipts(older_than_hours=1, keep_min=0)
+        assert result["pruned"] == 0
+
     def test_prune_removes_json_files(self, isolated_hermes_home):
-        from tools.execution_receipts import create_receipt, prune_receipts, _get_receipts_dir
+        from tools.execution_receipts import create_receipt, index_receipt, prune_receipts, _get_receipts_dir
         r = create_receipt(task_id="to_prune")
+        r.timestamp = time.time() - 7200
+        index_receipt(r)
         assert (_get_receipts_dir() / f"{r.receipt_id}.json").exists()
-        prune_receipts(older_than_hours=0, keep_min=0)
+        prune_receipts(older_than_hours=1, keep_min=0)
         assert not (_get_receipts_dir() / f"{r.receipt_id}.json").exists()
 
     def test_reconcile(self, isolated_hermes_home):
@@ -154,6 +196,20 @@ class TestReceiptLedger:
         }))
         result = reconcile_receipts()
         assert result["reindexed"] == 1
+
+    def test_reconcile_reports_parse_errors(self, isolated_hermes_home):
+        from tools.execution_receipts import _get_receipts_dir, maintenance_status, reconcile_receipts
+
+        bad_receipt = _get_receipts_dir() / "bad.json"
+        bad_receipt.write_text("not json")
+
+        result = reconcile_receipts()
+        assert not result["consistent"]
+        assert result["parse_errors"][0]["receipt_id"] == "bad"
+
+        status = maintenance_status()
+        assert not status["consistent"]
+        assert status["parse_errors"][0]["receipt_id"] == "bad"
 
     def test_maintenance_status(self, isolated_hermes_home):
         from tools.execution_receipts import create_receipt, maintenance_status
@@ -197,11 +253,13 @@ class TestReceiptsToolSurface:
         assert result["count"] == 1
 
     def test_tool_prune(self, isolated_hermes_home):
-        from tools.execution_receipts import create_receipt
+        from tools.execution_receipts import create_receipt, index_receipt
         from tools.execution_receipts_tool import _handle_receipts
         for i in range(5):
-            create_receipt(task_id=f"p{i}")
-        result = json.loads(_handle_receipts({"action": "prune", "older_than_hours": 0}))
+            receipt = create_receipt(task_id=f"p{i}")
+            receipt.timestamp = time.time() - 7200
+            index_receipt(receipt)
+        result = json.loads(_handle_receipts({"action": "prune", "older_than_hours": 1}))
         assert result["pruned"] >= 0
 
     def test_tool_reconcile(self, isolated_hermes_home):
