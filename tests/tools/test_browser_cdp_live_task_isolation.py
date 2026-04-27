@@ -1,4 +1,6 @@
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -37,6 +39,53 @@ class TestLiveCdpTaskIsolation:
         msg = str(exc.value)
         assert "shared-state" in msg
         assert "task-a" in msg
+
+    def test_concurrent_live_cdp_tasks_are_atomically_rejected(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.setattr(browser_tool, "_active_sessions", {})
+        monkeypatch.setattr(browser_tool, "_session_last_activity", {})
+        monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(browser_tool, "_update_session_activity", lambda task_id: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "ws://host:9222/devtools/browser/abc")
+        monkeypatch.setattr(browser_tool, "_ensure_cdp_supervisor", lambda task_id: None)
+
+        create_started = threading.Event()
+        release_create = threading.Event()
+        created_tasks = []
+
+        def slow_create_cdp_session(task_id, cdp_url):
+            created_tasks.append(task_id)
+            create_started.set()
+            assert release_create.wait(2), "timed out waiting to release test CDP session creation"
+            return {
+                "session_name": f"cdp_{task_id}",
+                "bb_session_id": None,
+                "cdp_url": cdp_url,
+                "features": {"cdp_override": True},
+            }
+
+        monkeypatch.setattr(browser_tool, "_create_cdp_session", slow_create_cdp_session)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(browser_tool._get_session_info, "task-a")
+            assert create_started.wait(2), "first task never started CDP session creation"
+            second = pool.submit(browser_tool._get_session_info, "task-b")
+            release_create.set()
+
+            outcomes = []
+            for future in (first, second):
+                try:
+                    outcomes.append(("ok", future.result(timeout=2)))
+                except RuntimeError as exc:
+                    outcomes.append(("error", str(exc)))
+
+        assert [kind for kind, _ in outcomes].count("ok") == 1
+        assert [kind for kind, _ in outcomes].count("error") == 1
+        error = next(value for kind, value in outcomes if kind == "error")
+        assert "shared-state" in error
+        assert len(created_tasks) == 1
+        assert len(browser_tool._active_sessions) == 1
 
     def test_non_cdp_sessions_can_still_coexist(self, monkeypatch):
         import tools.browser_tool as browser_tool
