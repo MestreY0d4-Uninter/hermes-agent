@@ -6,7 +6,9 @@ query, reconcile, and prune operations.
 
 import json
 import logging
+import os
 import sqlite3
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -19,19 +21,64 @@ logger = logging.getLogger(__name__)
 def _get_hermes_home() -> Path:
     """Resolve HERMES_HOME directory."""
     from hermes_constants import get_hermes_home
+
     return get_hermes_home()
 
 
 def _get_receipts_dir() -> Path:
-    """Get the receipts directory under HERMES_HOME."""
-    d = _get_hermes_home() / "execution-receipts"
+    """Get the durable receipts artifact directory under HERMES_HOME."""
+    d = _get_hermes_home() / "artifacts" / "execution-receipts"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def _get_receipts_db() -> Path:
-    """Get the SQLite ledger path."""
-    return _get_hermes_home() / "execution-receipts.db"
+    """Get the SQLite ledger path next to receipt artifacts."""
+    return _get_receipts_dir() / "receipts.sqlite3"
+
+
+def _receipt_path(receipt_id: str) -> Path:
+    """Return the JSON artifact path for a receipt id."""
+    return _get_receipts_dir() / f"{receipt_id}.json"
+
+
+def _fsync_dir(path: Path) -> None:
+    """Best-effort fsync for a directory after atomic replacement."""
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Atomically write bytes to a path using a temp file in the same directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
+            tmp_name = tmp.name
+            tmp.write(data)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+        _fsync_dir(path.parent)
+    finally:
+        if tmp_name:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write UTF-8 text to a path."""
+    _atomic_write_bytes(path, text.encode("utf-8"))
 
 
 @dataclass
@@ -65,9 +112,9 @@ class ExecutionReceipt:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
     def save(self) -> Path:
-        """Persist receipt as JSON file."""
-        path = _get_receipts_dir() / f"{self.receipt_id}.json"
-        path.write_text(self.to_json())
+        """Persist receipt as an atomic JSON artifact."""
+        path = _receipt_path(self.receipt_id)
+        _atomic_write_text(path, self.to_json())
         return path
 
 
@@ -76,6 +123,8 @@ def _get_connection() -> sqlite3.Connection:
     db_path = _get_receipts_db()
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     _ensure_schema(conn)
     return conn
 
@@ -135,6 +184,27 @@ def index_receipt(receipt: ExecutionReceipt) -> None:
         conn.close()
 
 
+def _persist_and_index_receipt(receipt: ExecutionReceipt) -> Path:
+    """Persist a receipt JSON artifact and index it, rolling back on index failure."""
+    path = _receipt_path(receipt.receipt_id)
+    existed = path.exists()
+    previous = path.read_bytes() if existed else None
+
+    receipt.save()
+    try:
+        index_receipt(receipt)
+    except Exception:
+        if previous is not None:
+            _atomic_write_bytes(path, previous)
+        else:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Failed to remove unindexed receipt artifact %s", path)
+        raise
+    return path
+
+
 def create_receipt(
     task_id: str = "",
     execution_path: str = "delegation",
@@ -152,17 +222,8 @@ def create_receipt(
         runtime_id=runtime_id,
         metadata=metadata or {},
     )
-    receipt.save()
-    index_receipt(receipt)
+    _persist_and_index_receipt(receipt)
     logger.debug("Created execution receipt %s for task %s", receipt.receipt_id, task_id)
-
-    try:
-        import random
-        if random.random() < 0.02:
-            prune_receipts(older_than_hours=168, keep_min=50)
-    except Exception:
-        pass
-
     return receipt
 
 
@@ -184,18 +245,17 @@ def finalize_receipt(
     receipt.summary = summary[:500]
     receipt.error = error[:500]
     receipt.runtime_reused = runtime_reused
-    receipt.save()
-    index_receipt(receipt)
+    _persist_and_index_receipt(receipt)
     return receipt
 
 
 def get_receipt(receipt_id: str) -> Optional[ExecutionReceipt]:
     """Load a receipt by ID from JSON file."""
-    path = _get_receipts_dir() / f"{receipt_id}.json"
+    path = _receipt_path(receipt_id)
     if not path.exists():
         return None
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         return ExecutionReceipt.from_dict(data)
     except (json.JSONDecodeError, TypeError):
         return None
@@ -252,19 +312,36 @@ def query_receipts(
         conn.close()
 
 
-def prune_receipts(older_than_hours: float = 72.0, keep_min: int = 10) -> Dict[str, Any]:
-    """Remove old receipts, keeping at least keep_min most recent."""
+def prune_receipts(
+    older_than_hours: float = 72.0,
+    keep_min: int = 10,
+    keep_failed: bool = True,
+) -> Dict[str, Any]:
+    """Remove old receipts, keeping at least keep_min most recent.
+
+    Failed receipts are kept by default because they are usually the most useful
+    audit records during debugging.
+    """
+    if older_than_hours <= 0:
+        raise ValueError("older_than_hours must be positive")
+
     conn = _get_connection()
     try:
         cutoff = time.time() - (older_than_hours * 3600)
         total = conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]
+        conditions = ["timestamp < ?"]
+        params: list[Any] = [cutoff]
+        if keep_failed:
+            conditions.append("status != 'failed'")
+        where = " AND ".join(conditions)
         old_rows = conn.execute(
-            "SELECT receipt_id FROM receipts WHERE timestamp < ? ORDER BY timestamp ASC",
-            (cutoff,),
+            f"SELECT receipt_id FROM receipts WHERE {where} ORDER BY timestamp ASC",
+            params,
         ).fetchall()
 
         can_prune = max(0, len(old_rows) - max(0, keep_min - (total - len(old_rows))))
         to_prune = [r["receipt_id"] for r in old_rows[:can_prune]]
+        missing_files: list[str] = []
 
         if to_prune:
             placeholders = ",".join("?" * len(to_prune))
@@ -275,59 +352,105 @@ def prune_receipts(older_than_hours: float = 72.0, keep_min: int = 10) -> Dict[s
                 f = receipts_dir / f"{rid}.json"
                 if f.exists():
                     f.unlink()
+                else:
+                    missing_files.append(rid)
 
         return {
             "total_before": total,
             "pruned": len(to_prune),
             "remaining": total - len(to_prune),
+            "deleted_receipt_ids": to_prune,
+            "missing_files": missing_files,
+            "cutoff": cutoff,
         }
     finally:
         conn.close()
 
 
+def _scan_receipt_files(receipts_dir: Path) -> tuple[Dict[str, ExecutionReceipt], List[Dict[str, str]], int]:
+    """Scan receipt JSON artifacts and return valid receipts plus parse errors."""
+    valid: Dict[str, ExecutionReceipt] = {}
+    parse_errors: List[Dict[str, str]] = []
+    total_files = 0
+    for path in receipts_dir.glob("*.json"):
+        if not path.is_file():
+            continue
+        total_files += 1
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            receipt = ExecutionReceipt.from_dict(data)
+            if not receipt.receipt_id:
+                raise ValueError("receipt_id is missing")
+            if receipt.receipt_id != path.stem:
+                raise ValueError(
+                    f"receipt_id {receipt.receipt_id!r} does not match file stem {path.stem!r}"
+                )
+        except Exception as exc:
+            parse_errors.append({
+                "receipt_id": path.stem,
+                "path": str(path),
+                "error": str(exc),
+            })
+            continue
+        valid[receipt.receipt_id] = receipt
+    return valid, parse_errors, total_files
+
+
 def reconcile_receipts() -> Dict[str, Any]:
     """Reconcile JSON files vs SQLite ledger — fix inconsistencies."""
     receipts_dir = _get_receipts_dir()
+    valid_receipts, parse_errors, total_json_files = _scan_receipt_files(receipts_dir)
     conn = _get_connection()
     try:
         db_ids = {r["receipt_id"] for r in conn.execute("SELECT receipt_id FROM receipts").fetchall()}
-        json_ids = {f.stem for f in receipts_dir.glob("*.json") if f.is_file()}
+        json_ids = set(valid_receipts)
 
-        in_db_only = db_ids - json_ids
+        in_db_only = db_ids - json_ids - {e["receipt_id"] for e in parse_errors}
         in_files_only = json_ids - db_ids
 
         reindexed = 0
-        for rid in in_files_only:
-            receipt = get_receipt(rid)
-            if receipt:
-                index_receipt(receipt)
-                reindexed += 1
+        reindexed_ids: list[str] = []
+        for rid in sorted(in_files_only):
+            index_receipt(valid_receipts[rid])
+            reindexed += 1
+            reindexed_ids.append(rid)
 
         removed_from_db = 0
-        for rid in in_db_only:
+        removed_ids: list[str] = []
+        for rid in sorted(in_db_only):
             conn.execute("DELETE FROM receipts WHERE receipt_id = ?", (rid,))
             removed_from_db += 1
+            removed_ids.append(rid)
         if removed_from_db:
             conn.commit()
 
         return {
-            "json_files": len(json_ids),
+            "json_files": total_json_files,
+            "valid_json_files": len(valid_receipts),
             "db_entries": len(db_ids),
             "reindexed": reindexed,
+            "reindexed_receipt_ids": reindexed_ids,
             "removed_from_db": removed_from_db,
-            "consistent": len(in_db_only) == 0 and len(in_files_only) == 0,
+            "removed_from_db_receipt_ids": removed_ids,
+            "parse_errors": parse_errors,
+            "consistent": not in_db_only and not in_files_only and not parse_errors,
         }
     finally:
         conn.close()
 
 
 def maintenance_status() -> Dict[str, Any]:
-    """Get current maintenance status of the receipts system."""
+    """Get current maintenance status of the receipts system without mutating it."""
     receipts_dir = _get_receipts_dir()
+    valid_receipts, parse_errors, total_json_files = _scan_receipt_files(receipts_dir)
     conn = _get_connection()
     try:
-        total_db = conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]
-        json_files = len(list(receipts_dir.glob("*.json")))
+        rows = conn.execute("SELECT receipt_id FROM receipts").fetchall()
+        db_ids = {r["receipt_id"] for r in rows}
+        json_ids = set(valid_receipts)
+        missing_files = sorted(db_ids - json_ids - {e["receipt_id"] for e in parse_errors})
+        unindexed_files = sorted(json_ids - db_ids)
+        total_db = len(db_ids)
         db_size = _get_receipts_db().stat().st_size if _get_receipts_db().exists() else 0
         dir_size = sum(f.stat().st_size for f in receipts_dir.glob("*.json") if f.is_file())
         oldest = conn.execute("SELECT MIN(timestamp) FROM receipts").fetchone()[0]
@@ -335,12 +458,16 @@ def maintenance_status() -> Dict[str, Any]:
 
         return {
             "total_receipts": total_db,
-            "json_files": json_files,
+            "json_files": total_json_files,
+            "valid_json_files": len(valid_receipts),
             "db_size_bytes": db_size,
             "dir_size_bytes": dir_size,
             "oldest_timestamp": oldest,
             "newest_timestamp": newest,
-            "consistent": total_db == json_files,
+            "missing_files": missing_files,
+            "unindexed_files": unindexed_files,
+            "parse_errors": parse_errors,
+            "consistent": not missing_files and not unindexed_files and not parse_errors,
         }
     finally:
         conn.close()
