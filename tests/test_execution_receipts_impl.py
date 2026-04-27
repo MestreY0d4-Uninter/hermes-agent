@@ -273,5 +273,3 @@ class TestReceiptsToolSurface:
         from tools.execution_receipts_tool import _handle_receipts
         result = json.loads(_handle_receipts({"action": "maintenance_status"}))
         assert "total_receipts" in result
-
-

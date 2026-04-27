@@ -74,6 +74,12 @@ from model_tools import (
     check_toolset_requirements,
 )
 from tools.terminal_tool import cleanup_vm, get_active_env, is_persistent_env
+from tools.terminal_tool import (
+    set_approval_callback as _set_approval_callback,
+    set_sudo_password_callback as _set_sudo_password_callback,
+    _get_approval_callback,
+    _get_sudo_password_callback,
+)
 from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
@@ -3241,6 +3247,21 @@ class AIAgent:
 
         def _run_review():
             import contextlib
+            # Install a non-interactive approval callback on this worker
+            # thread so any dangerous-command guard the review agent trips
+            # resolves to "deny" instead of falling back to input() -- which
+            # deadlocks against the parent's prompt_toolkit TUI (#15216).
+            # Same pattern as _subagent_auto_deny in tools/delegate_tool.py.
+            def _bg_review_auto_deny(command, description, **kwargs):
+                logger.warning(
+                    "Background review auto-denied dangerous command: %s (%s)",
+                    command, description,
+                )
+                return "deny"
+            try:
+                _set_approval_callback(_bg_review_auto_deny)
+            except Exception:
+                pass
             review_agent = None
             try:
                 with open(os.devnull, "w") as _devnull, \
@@ -3266,6 +3287,7 @@ class AIAgent:
                         api_key=_parent_runtime.get("api_key") or None,
                         credential_pool=getattr(self, "_credential_pool", None),
                         parent_session_id=self.session_id,
+                        enabled_toolsets=["memory", "skills"],
                     )
                     review_agent._memory_write_origin = "background_review"
                     review_agent._memory_write_context = "background_review"
@@ -3322,6 +3344,12 @@ class AIAgent:
                         review_agent.close()
                     except Exception:
                         pass
+                # Clear the approval callback on this bg-review thread so a
+                # recycled thread-id doesn't inherit a stale reference.
+                try:
+                    _set_approval_callback(None)
+                except Exception:
+                    pass
 
         t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
         t.start()
@@ -7287,6 +7315,26 @@ class AIAgent:
         self._anthropic_image_fallback_cache[cache_key] = note
         return note
 
+    def _model_supports_vision(self) -> bool:
+        """Return True if the active provider+model reports native vision.
+
+        Used to decide whether to strip image content parts from API-bound
+        messages (for non-vision models) or let the provider adapter handle
+        them natively (for vision-capable models).
+        """
+        try:
+            from agent.models_dev import get_model_capabilities
+            provider = (getattr(self, "provider", "") or "").strip()
+            model = (getattr(self, "model", "") or "").strip()
+            if not provider or not model:
+                return False
+            caps = get_model_capabilities(provider, model)
+            if caps is None:
+                return False
+            return bool(caps.supports_vision)
+        except Exception:
+            return False
+
     def _preprocess_anthropic_content(self, content: Any, role: str) -> Any:
         if not self._content_has_image_parts(content):
             return content
@@ -7350,12 +7398,23 @@ class AIAgent:
         return t
 
     def _prepare_anthropic_messages_for_api(self, api_messages: list) -> list:
+        # Fast exit when no message carries image content at all.
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
             for msg in api_messages
         ):
             return api_messages
 
+        # The Anthropic adapter (agent/anthropic_adapter.py:_convert_content_part_to_anthropic)
+        # already translates OpenAI-style image_url/input_image parts into
+        # native Anthropic ``{"type": "image", "source": ...}`` blocks. When
+        # the active model supports vision we let the adapter do its job and
+        # skip this legacy text-fallback preprocessor entirely.
+        if self._model_supports_vision():
+            return api_messages
+
+        # Non-vision Anthropic model (rare today, but keep the fallback for
+        # compat): replace each image part with a vision_analyze text note.
         transformed = copy.deepcopy(api_messages)
         for msg in transformed:
             if not isinstance(msg, dict):
@@ -7365,6 +7424,150 @@ class AIAgent:
                 str(msg.get("role", "user") or "user"),
             )
         return transformed
+
+    def _prepare_messages_for_non_vision_model(self, api_messages: list) -> list:
+        """Strip native image parts when the active model lacks vision.
+
+        Runs on the chat.completions / codex_responses paths. Vision-capable
+        models pass through unchanged (provider and any downstream translator
+        handle the image parts natively). Non-vision models get each image
+        replaced by a cached vision_analyze text description so the turn
+        doesn't fail with "model does not support image input".
+        """
+        if not any(
+            isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
+            for msg in api_messages
+        ):
+            return api_messages
+
+        if self._model_supports_vision():
+            return api_messages
+
+        transformed = copy.deepcopy(api_messages)
+        for msg in transformed:
+            if not isinstance(msg, dict):
+                continue
+            # Reuse the Anthropic text-fallback preprocessor — the behaviour is
+            # identical (walk content parts, replace images with cached
+            # descriptions, merge back into a single text or structured
+            # content). Naming is historical.
+            msg["content"] = self._preprocess_anthropic_content(
+                msg.get("content"),
+                str(msg.get("role", "user") or "user"),
+            )
+        return transformed
+
+    def _try_shrink_image_parts_in_messages(self, api_messages: list) -> bool:
+        """Re-encode all native image parts at a smaller size to recover from
+        image-too-large errors (Anthropic 5 MB, unknown other providers).
+
+        Mutates ``api_messages`` in place. Returns True if any image part was
+        actually replaced, False if there were no image parts to shrink or
+        Pillow couldn't help (caller should surface the original error).
+
+        Strategy: look for ``image_url`` / ``input_image`` parts carrying a
+        ``data:image/...;base64,...`` payload.  For each one whose encoded
+        size exceeds 4 MB (a safe target that slides under Anthropic's 5 MB
+        ceiling with header overhead), write the base64 to a tempfile, call
+        ``vision_tools._resize_image_for_vision`` to produce a smaller data
+        URL, and substitute it in place.
+
+        Non-data-URL images (http/https URLs) are not touched — the provider
+        fetches those itself and the size limit is different.
+        """
+        if not api_messages:
+            return False
+
+        try:
+            from tools.vision_tools import _resize_image_for_vision
+        except Exception as exc:
+            logger.warning("image-shrink recovery: vision_tools unavailable — %s", exc)
+            return False
+
+        # 4 MB target leaves comfortable headroom under Anthropic's 5 MB.
+        # Non-Anthropic providers we haven't observed rejecting are fine with
+        # much larger; shrinking to 4 MB here loses quality but only fires
+        # after a confirmed provider rejection, so the alternative is failure.
+        target_bytes = 4 * 1024 * 1024
+        changed_count = 0
+
+        def _shrink_data_url(url: str) -> Optional[str]:
+            """Return a smaller data URL, or None if shrink can't help."""
+            if not isinstance(url, str) or not url.startswith("data:"):
+                return None
+            if len(url) <= target_bytes:
+                # This specific image wasn't the oversized one.
+                return None
+            try:
+                header, _, data = url.partition(",")
+                mime = "image/jpeg"
+                if header.startswith("data:"):
+                    mime_part = header[len("data:"):].split(";", 1)[0].strip()
+                    if mime_part.startswith("image/"):
+                        mime = mime_part
+                import base64 as _b64
+                raw = _b64.b64decode(data)
+                suffix = {
+                    "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+                    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/bmp": ".bmp",
+                }.get(mime, ".jpg")
+                tmp = tempfile.NamedTemporaryFile(
+                    prefix="hermes_shrink_", suffix=suffix, delete=False,
+                )
+                try:
+                    tmp.write(raw)
+                    tmp.close()
+                    resized = _resize_image_for_vision(
+                        Path(tmp.name),
+                        mime_type=mime,
+                        max_base64_bytes=target_bytes,
+                    )
+                finally:
+                    try:
+                        Path(tmp.name).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                if not resized or len(resized) >= len(url):
+                    # Shrink didn't help (or made it bigger — corrupt input?).
+                    return None
+                return resized
+            except Exception as exc:
+                logger.warning("image-shrink recovery: re-encode failed — %s", exc)
+                return None
+
+        for msg in api_messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype not in {"image_url", "input_image"}:
+                    continue
+                image_value = part.get("image_url")
+                # OpenAI chat.completions: {"image_url": {"url": "data:..."}}
+                # OpenAI Responses: {"image_url": "data:..."}
+                if isinstance(image_value, dict):
+                    url = image_value.get("url", "")
+                    resized = _shrink_data_url(url)
+                    if resized:
+                        image_value["url"] = resized
+                        changed_count += 1
+                elif isinstance(image_value, str):
+                    resized = _shrink_data_url(image_value)
+                    if resized:
+                        part["image_url"] = resized
+                        changed_count += 1
+
+        if changed_count:
+            logger.info(
+                "image-shrink recovery: re-encoded %d image part(s) to fit under %.0f MB",
+                changed_count, target_bytes / (1024 * 1024),
+            )
+        return changed_count > 0
 
     def _anthropic_preserve_dots(self) -> bool:
         """True when using an anthropic-compatible endpoint that preserves dots in model names.
@@ -7514,9 +7717,10 @@ class AIAgent:
                 )
             )
             is_xai_responses = self.provider == "xai" or self._base_url_hostname == "api.x.ai"
+            _msgs_for_codex = self._prepare_messages_for_non_vision_model(api_messages)
             return _ct.build_kwargs(
                 model=self.model,
-                messages=api_messages,
+                messages=_msgs_for_codex,
                 tools=self.tools,
                 reasoning_config=self.reasoning_config,
                 session_id=getattr(self, "session_id", None),
@@ -7595,9 +7799,12 @@ class AIAgent:
         if _ephemeral_out is not None:
             self._ephemeral_max_output_tokens = None
 
+        # Strip image parts for non-vision models (no-op when vision-capable).
+        _msgs_for_chat = self._prepare_messages_for_non_vision_model(api_messages)
+
         return _ct.build_kwargs(
             model=self.model,
-            messages=api_messages,
+            messages=_msgs_for_chat,
             tools=self.tools,
             timeout=self._resolved_api_call_timeout(),
             max_tokens=self.max_tokens,
@@ -8469,6 +8676,14 @@ class AIAgent:
         self._current_tool = tool_names_str
         self._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
+        # Capture CLI callbacks from the agent thread so worker threads can
+        # register them locally.  Without this, _get_approval_callback() in
+        # terminal_tool returns None in ThreadPoolExecutor workers, causing
+        # the dangerous-command prompt to fall back to input() — which
+        # deadlocks against prompt_toolkit's raw terminal mode (#13617).
+        _parent_approval_cb = _get_approval_callback()
+        _parent_sudo_cb = _get_sudo_password_callback()
+
         def _run_tool(index, tool_call, function_name, function_args):
             """Worker function executed in a thread."""
             # Register this worker tid so the agent can fan out an interrupt
@@ -8495,6 +8710,18 @@ class AIAgent:
                 set_activity_callback(self._touch_activity)
             except Exception:
                 pass
+            # Propagate approval/sudo callbacks to this worker thread.
+            # Mirrors cli.py run_agent() pattern (GHSA-qg5c-hvr5-hjgr).
+            if _parent_approval_cb is not None:
+                try:
+                    _set_approval_callback(_parent_approval_cb)
+                except Exception:
+                    pass
+            if _parent_sudo_cb is not None:
+                try:
+                    _set_sudo_password_callback(_parent_sudo_cb)
+                except Exception:
+                    pass
             start = time.time()
             try:
                 result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id, messages=messages)
@@ -8515,6 +8742,13 @@ class AIAgent:
                 self._tool_worker_threads.discard(_worker_tid)
             try:
                 _set_interrupt(False, _worker_tid)
+            except Exception:
+                pass
+            # Clear thread-local callbacks so a recycled worker thread
+            # doesn't hold stale references to a disposed CLI instance.
+            try:
+                _set_approval_callback(None)
+                _set_sudo_password_callback(None)
             except Exception:
                 pass
 
@@ -9891,6 +10125,7 @@ class AIAgent:
             nous_auth_retry_attempted=False
             copilot_auth_retry_attempted=False
             thinking_sig_retry_attempted = False
+            image_shrink_retry_attempted = False
             has_retried_429 = False
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
@@ -10812,6 +11047,31 @@ class AIAgent:
                     )
                     if recovered_with_pool:
                         continue
+
+                    # Image-too-large recovery: shrink oversized native image
+                    # parts in-place and retry once.  Triggered by Anthropic's
+                    # per-image 5 MB ceiling (400 with "image exceeds 5 MB
+                    # maximum") or any other provider that complains about
+                    # image size.  If shrink fails or a second attempt still
+                    # fails, fall through to normal error handling.
+                    if (
+                        classified.reason == FailoverReason.image_too_large
+                        and not image_shrink_retry_attempted
+                    ):
+                        image_shrink_retry_attempted = True
+                        if self._try_shrink_image_parts_in_messages(api_messages):
+                            self._vprint(
+                                f"{self.log_prefix}📐 Image(s) exceeded provider size limit — "
+                                f"shrank and retrying...",
+                                force=True,
+                            )
+                            continue
+                        else:
+                            logger.info(
+                                "image-shrink recovery: no data-URL image parts found "
+                                "or shrink didn't reduce size; surfacing original error."
+                            )
+
                     if (
                         self.api_mode == "codex_responses"
                         and self.provider == "openai-codex"
