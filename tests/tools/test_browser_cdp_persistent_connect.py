@@ -50,6 +50,7 @@ class TestLiveCdpPersistentConnect:
         ]
         assert connect_socket_dir == os.path.join(str(tmp_path), "agent-browser-live-session")
         assert connect_env["AGENT_BROWSER_SOCKET_DIR"] == connect_socket_dir
+        assert connect_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] == str(browser_tool.BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
 
         open_cmd, open_name, *_ = captured[1]
         get_cmd, get_name, *_ = captured[2]
