@@ -166,10 +166,32 @@ def _model_provider_listing_lines(providers) -> list[str]:
     return lines
 
 
+class ModelSwitchConfirmation(str):
+    """Successful typed ``/model`` switch reply.
+
+    Structural marker so the dispatcher can route an inline payload after the switch without
+    parsing localized confirmation text; error/picker/help replies are plain strings.
+    """
+
+    __slots__ = ()
+
+
 class GatewayModelCommandsMixin:
     """Model-route slash commands (/model, /codex-runtime, /reasoning, /fast, /personality)."""
 
     # ----------------------------------------------------------------- /model
+
+    @staticmethod
+    def _split_inline_command_payload(event: MessageEvent) -> tuple[MessageEvent, str]:
+        """Split ``/model <name>\\n<payload>`` → (command-line event, inline payload).
+
+        No newline returns the event unchanged with an empty payload; otherwise the event copy
+        carries the command line only and the payload is returned for post-switch routing.
+        """
+        command_line, _, payload = (event.text or "").partition("\n")
+        if not payload:
+            return event, ""
+        return dataclasses.replace(event, text=command_line.rstrip("\r")), payload.lstrip("\r\n")
 
     async def _perform_model_switch(
         self, ctx: _ModelSwitchContext, raw_input: str, explicit_provider, source
@@ -357,7 +379,9 @@ class GatewayModelCommandsMixin:
         if error is not None:
             return error
         await self._record_model_switch(result, ctx, source=source, one_turn=one_turn, picker=picker)
-        return await self._model_switch_confirmation(result, ctx, one_turn=one_turn, picker=picker)
+        return ModelSwitchConfirmation(
+            await self._model_switch_confirmation(result, ctx, one_turn=one_turn, picker=picker)
+        )
 
     async def _send_model_picker(self, event: MessageEvent, source, adapter, session_key: str, listing_kwargs: dict, on_model_selected) -> bool:
         """Send the interactive /model picker; False when nothing was sent (text fallback). *source*
